@@ -79,13 +79,18 @@ jobs:
       - name: 🔴 Destroy VM précédente (si elle existe)
         working-directory: ${{ env.TF_DIR }}
         run: |
-          EXISTING=$(terraform output -raw public_ip 2>/dev/null || echo "")
-          if [ -n "$EXISTING" ]; then
-            echo "🔴 VM existante détectée ($EXISTING) — destruction en cours..."
+          INSTANCE_COUNT=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=gmao-server" \
+                      "Name=instance-state-name,Values=running,stopped,pending" \
+            --query "length(Reservations[].Instances[])" \
+            --output text 2>/dev/null || echo "0")
+
+          if [ "$INSTANCE_COUNT" -gt "0" ] 2>/dev/null; then
+            echo "🔴 $INSTANCE_COUNT VM(s) existante(s) détectée(s) — destruction en cours..."
             terraform destroy -auto-approve
-            echo "✅ VM précédente détruite"
+            echo "✅ VM(s) précédente(s) détruite(s)"
           else
-            echo "ℹ️ Aucune VM existante dans le state — on continue"
+            echo "ℹ️ Aucune VM existante — on continue directement"
           fi
       # ─────────────────────────────────────────────────────────────────────
 
