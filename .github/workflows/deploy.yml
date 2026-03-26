@@ -79,16 +79,22 @@ jobs:
       - name: 🔴 Destroy VM précédente (si elle existe)
         working-directory: ${{ env.TF_DIR }}
         run: |
-          INSTANCE_COUNT=$(aws ec2 describe-instances \
+          INSTANCE_IDS=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=gmao-server" \
                       "Name=instance-state-name,Values=running,stopped,pending" \
-            --query "length(Reservations[].Instances[])" \
-            --output text 2>/dev/null || echo "0")
+            --query "Reservations[].Instances[].InstanceId" \
+            --output text 2>/dev/null || echo "")
 
-          if [ "$INSTANCE_COUNT" -gt "0" ] 2>/dev/null; then
-            echo "🔴 $INSTANCE_COUNT VM(s) existante(s) détectée(s) — destruction en cours..."
-            terraform destroy -auto-approve
-            echo "✅ VM(s) précédente(s) détruite(s)"
+          if [ -n "$INSTANCE_IDS" ]; then
+            COUNT=$(echo "$INSTANCE_IDS" | wc -w)
+            echo "🔴 $COUNT VM(s) détectée(s) : $INSTANCE_IDS"
+            echo "   Suppression via AWS CLI..."
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS
+            echo "   Attente de la terminaison complète..."
+            aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS
+            echo "✅ $COUNT VM(s) supprimée(s) avec succès"
+            terraform state list 2>/dev/null | xargs -r terraform state rm 2>/dev/null || true
+            echo "✅ State Terraform nettoyé"
           else
             echo "ℹ️ Aucune VM existante — on continue directement"
           fi
