@@ -34,6 +34,9 @@ env:
   TF_DIR: ./terraform
   AWS_REGION: us-east-1
 
+# ════════════════════════════════════════════════════════════════════════════
+#  Concurrency : évite les exécutions parallèles sur la même branche
+# ════════════════════════════════════════════════════════════════════════════
 concurrency:
   group: gmao-deploy-${{ github.ref }}
   cancel-in-progress: false
@@ -74,20 +77,6 @@ jobs:
       - name: 🔧 Terraform Init
         working-directory: ${{ env.TF_DIR }}
         run: terraform init
-
-      # ── NOUVEAU : Destroy VM précédente avant toute création ─────────────
-      - name: 🔴 Destroy VM précédente (si elle existe)
-        working-directory: ${{ env.TF_DIR }}
-        run: |
-          EXISTING=$(terraform output -raw public_ip 2>/dev/null || echo "")
-          if [ -n "$EXISTING" ]; then
-            echo "🔴 VM existante détectée ($EXISTING) — destruction en cours..."
-            terraform destroy -auto-approve
-            echo "✅ VM précédente détruite"
-          else
-            echo "ℹ️ Aucune VM existante dans le state — on continue"
-          fi
-      # ─────────────────────────────────────────────────────────────────────
 
       - name: 🔍 Vérification VM existante
         id: check_vm
@@ -258,6 +247,7 @@ jobs:
 
 # ════════════════════════════════════════════════════════════════════════════
 #  JOB 3 — Démarrage Application (DB + Backend Spring Boot + Frontend Angular)
+#  → TOUJOURS exécuté (kill + restart) pour garantir l'état de l'app
 # ════════════════════════════════════════════════════════════════════════════
   job3_start_app:
     name: "JOB 3 — Démarrage Application GMAO"
@@ -288,6 +278,7 @@ jobs:
             IdentityFile ~/.ssh/vockey.pem
           EOF
 
+      # ── Copie des fichiers nécessaires sur la VM ──────────────────────
       - name: 📤 Copie du dossier BD/ (restore.sh + backup SQL)
         run: |
           ssh -i ~/.ssh/vockey.pem \
@@ -313,6 +304,7 @@ jobs:
               ubuntu@${{ env.VM_IP }} \
               "chmod +x ~/03_start_app.sh && ~/03_start_app.sh"
 
+      # ── Tests de connectivité ────────────────────────────────────────────
       - name: 🔍 Test de connectivité Backend (port 8080)
         run: |
           echo "Test http://${{ env.VM_IP }}:8080 ..."
@@ -358,6 +350,8 @@ jobs:
 
 # ════════════════════════════════════════════════════════════════════════════
 #  JOB 4 — 🔴 Destruction de l'infrastructure (terraform destroy)
+#  → Uniquement via workflow_dispatch avec destroy_infra = true
+#  → Les Jobs 1-3 sont automatiquement skippés
 # ════════════════════════════════════════════════════════════════════════════
   job4_destroy:
     name: "JOB 4 — 🔴 Terraform Destroy"
