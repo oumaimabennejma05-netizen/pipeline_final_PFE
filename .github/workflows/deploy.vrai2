@@ -2,7 +2,7 @@ name: GMAO — Deploy Pipeline
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
     inputs:
       force_recreate_vm:
@@ -21,14 +21,19 @@ on:
         options:
           - "false"
           - "true"
+      destroy_infra:
+        description: "🔴 Détruire l'infrastructure (terraform destroy)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 env:
   TF_DIR: ./terraform
   AWS_REGION: us-east-1
 
-# ════════════════════════════════════════════════════════════════════════════
-#  Concurrency : évite les exécutions parallèles sur la même branche
-# ════════════════════════════════════════════════════════════════════════════
 concurrency:
   group: gmao-deploy-${{ github.ref }}
   cancel-in-progress: false
@@ -37,11 +42,11 @@ jobs:
 
 # ════════════════════════════════════════════════════════════════════════════
 #  JOB 1 — Création / Vérification VM EC2
-#  → Si la VM existe et répond en SSH, on skip la création
 # ════════════════════════════════════════════════════════════════════════════
   job1_create_vm:
     name: "JOB 1 — Création / Vérification VM EC2"
     runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.destroy_infra != 'true' }}
 
     outputs:
       public_ip:   ${{ steps.resolve_ip.outputs.public_ip }}
@@ -70,20 +75,41 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: terraform init
 
-      # ── Vérifier si la VM existe déjà via Terraform state ────────────────
+      # ── NOUVEAU : Destroy VM précédente avant toute création ─────────────
+      - name: 🔴 Destroy VM précédente (si elle existe)
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=gmao-server" \
+                      "Name=instance-state-name,Values=running,stopped,pending" \
+            --query "Reservations[].Instances[].InstanceId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$INSTANCE_IDS" ]; then
+            COUNT=$(echo "$INSTANCE_IDS" | wc -w)
+            echo "🔴 $COUNT VM(s) détectée(s) : $INSTANCE_IDS"
+            echo "   Suppression via AWS CLI..."
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS
+            echo "   Attente de la terminaison complète..."
+            aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS
+            echo "✅ $COUNT VM(s) supprimée(s) avec succès"
+            terraform state list 2>/dev/null | xargs -r terraform state rm 2>/dev/null || true
+            echo "✅ State Terraform nettoyé"
+          else
+            echo "ℹ️ Aucune VM existante — on continue directement"
+          fi
+      # ─────────────────────────────────────────────────────────────────────
+
       - name: 🔍 Vérification VM existante
         id: check_vm
         working-directory: ${{ env.TF_DIR }}
         run: |
-          # Tenter de lire l'IP depuis le state Terraform existant
           EXISTING_IP=$(terraform output -raw public_ip 2>/dev/null || echo "")
           EXISTING_ID=$(terraform output -raw instance_id 2>/dev/null || echo "")
           FORCE="${{ github.event.inputs.force_recreate_vm || 'false' }}"
 
           if [ -n "$EXISTING_IP" ] && [ "$FORCE" != "true" ]; then
             echo "🔎 VM détectée dans le state : $EXISTING_ID ($EXISTING_IP)"
-
-            # Vérifier que la VM est réellement accessible (running + SSH)
             INSTANCE_STATE=$(aws ec2 describe-instances \
               --instance-ids "$EXISTING_ID" \
               --query 'Reservations[0].Instances[0].State.Name' \
@@ -95,7 +121,7 @@ jobs:
               echo "existing_ip=$EXISTING_IP" >> $GITHUB_OUTPUT
               echo "existing_id=$EXISTING_ID" >> $GITHUB_OUTPUT
             else
-              echo "⚠️ VM existe dans le state mais état=$INSTANCE_STATE → re-création"
+              echo "⚠️ VM état=$INSTANCE_STATE → re-création"
               echo "vm_exists=false" >> $GITHUB_OUTPUT
             fi
           else
@@ -103,7 +129,6 @@ jobs:
             echo "vm_exists=false" >> $GITHUB_OUTPUT
           fi
 
-      # ── Création si nécessaire ───────────────────────────────────────────
       - name: ✅ Terraform Validate
         if: steps.check_vm.outputs.vm_exists != 'true'
         working-directory: ${{ env.TF_DIR }}
@@ -119,7 +144,6 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: terraform apply -auto-approve tfplan
 
-      # ── Résolution finale de l'IP (créée ou existante) ───────────────────
       - name: 📤 Résolution IP finale
         id: resolve_ip
         working-directory: ${{ env.TF_DIR }}
@@ -139,7 +163,6 @@ jobs:
           echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
           echo "→ ID: $INSTANCE_ID | IP: $PUBLIC_IP"
 
-      # ── Attente SSH ──────────────────────────────────────────────────────
       - name: ⏳ Attente SSH disponible (2 min max)
         run: |
           VM_IP="${{ steps.resolve_ip.outputs.public_ip }}"
@@ -157,12 +180,12 @@ jobs:
 
 # ════════════════════════════════════════════════════════════════════════════
 #  JOB 2 — Post-installation (packages + projets)
-#  → Vérifie si les outils sont déjà installés avant de relancer
 # ════════════════════════════════════════════════════════════════════════════
   job2_post_install:
     name: "JOB 2 — Post-Installation"
     runs-on: ubuntu-latest
     needs: job1_create_vm
+    if: ${{ github.event.inputs.destroy_infra != 'true' }}
 
     env:
       VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
@@ -174,16 +197,19 @@ jobs:
       - name: 🔑 Configuration clé SSH (vockey)
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
           chmod 600 ~/.ssh/vockey.pem
+          ssh-keygen -l -f ~/.ssh/vockey.pem || {
+            echo "❌ Clé SSH invalide — vérifiez le secret SSH_PRIVATE_KEY"
+            exit 1
+          }
           cat >> ~/.ssh/config <<EOF
-          Host ${{ env.VM_IP }}
+          Host *
             StrictHostKeyChecking no
             UserKnownHostsFile /dev/null
             IdentityFile ~/.ssh/vockey.pem
           EOF
 
-      # ── Vérifier si le post-install a déjà été fait ──────────────────────
       - name: 🔍 Vérification installations existantes
         id: check_install
         run: |
@@ -194,7 +220,6 @@ jobs:
             exit 0
           fi
 
-          # Vérifier si les outils clés sont déjà installés
           INSTALLED=$(ssh -i ~/.ssh/vockey.pem \
               -o StrictHostKeyChecking=no \
               -o ConnectTimeout=10 \
@@ -211,7 +236,6 @@ jobs:
             echo "already_installed=false" >> $GITHUB_OUTPUT
           fi
 
-      # ── Installation si nécessaire ───────────────────────────────────────
       - name: 📤 Copie du script post-install sur la VM
         if: steps.check_install.outputs.already_installed != 'true'
         run: |
@@ -229,7 +253,6 @@ jobs:
               ubuntu@${{ env.VM_IP }} \
               "chmod +x ~/02_post_install.sh && ~/02_post_install.sh"
 
-      # ── Vérification (toujours exécutée) ─────────────────────────────────
       - name: ✅ Vérification des installations
         run: |
           ssh -i ~/.ssh/vockey.pem \
@@ -246,12 +269,12 @@ jobs:
 
 # ════════════════════════════════════════════════════════════════════════════
 #  JOB 3 — Démarrage Application (DB + Backend Spring Boot + Frontend Angular)
-#  → Vérifie si les services tournent déjà avant de relancer
 # ════════════════════════════════════════════════════════════════════════════
   job3_start_app:
     name: "JOB 3 — Démarrage Application GMAO"
     runs-on: ubuntu-latest
     needs: [job1_create_vm, job2_post_install]
+    if: ${{ github.event.inputs.destroy_infra != 'true' }}
 
     env:
       VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
@@ -263,32 +286,30 @@ jobs:
       - name: 🔑 Configuration clé SSH (vockey)
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
           chmod 600 ~/.ssh/vockey.pem
+          ssh-keygen -l -f ~/.ssh/vockey.pem || {
+            echo "❌ Clé SSH invalide — vérifiez le secret SSH_PRIVATE_KEY"
+            exit 1
+          }
+          cat >> ~/.ssh/config <<EOF
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            IdentityFile ~/.ssh/vockey.pem
+          EOF
 
-      # ── Vérifier si l'app tourne déjà ────────────────────────────────────
-      - name: 🔍 Vérification services existants
-        id: check_app
+      - name: 📤 Copie du dossier BD/ (restore.sh + backup SQL)
         run: |
-          BACKEND_UP=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
-            http://${{ env.VM_IP }}:8080 2>/dev/null || echo "000")
-          FRONTEND_UP=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
-            http://${{ env.VM_IP }}:4200 2>/dev/null || echo "000")
+          ssh -i ~/.ssh/vockey.pem \
+              -o StrictHostKeyChecking=no \
+              ubuntu@${{ env.VM_IP }} "mkdir -p ~/BD"
+          scp -i ~/.ssh/vockey.pem \
+              -o StrictHostKeyChecking=no \
+              -r BD/* \
+              ubuntu@${{ env.VM_IP }}:~/BD/
 
-          echo "Backend HTTP status:  $BACKEND_UP"
-          echo "Frontend HTTP status: $FRONTEND_UP"
-
-          if [ "$BACKEND_UP" != "000" ] && [ "$FRONTEND_UP" != "000" ]; then
-            echo "✅ Backend ET Frontend déjà opérationnels → skip démarrage"
-            echo "app_running=true" >> $GITHUB_OUTPUT
-          else
-            echo "🔄 Démarrage nécessaire (backend=$BACKEND_UP, frontend=$FRONTEND_UP)"
-            echo "app_running=false" >> $GITHUB_OUTPUT
-          fi
-
-      # ── Démarrage si nécessaire ──────────────────────────────────────────
       - name: 📤 Copie du script de démarrage
-        if: steps.check_app.outputs.app_running != 'true'
         run: |
           scp -i ~/.ssh/vockey.pem \
               -o StrictHostKeyChecking=no \
@@ -296,7 +317,6 @@ jobs:
               ubuntu@${{ env.VM_IP }}:~/03_start_app.sh
 
       - name: 🚀 Lancement (restore DB + Spring Boot + Angular)
-        if: steps.check_app.outputs.app_running != 'true'
         timeout-minutes: 10
         run: |
           ssh -i ~/.ssh/vockey.pem \
@@ -304,7 +324,6 @@ jobs:
               ubuntu@${{ env.VM_IP }} \
               "chmod +x ~/03_start_app.sh && ~/03_start_app.sh"
 
-      # ── Tests de connectivité (toujours exécutés) ────────────────────────
       - name: 🔍 Test de connectivité Backend (port 8080)
         run: |
           echo "Test http://${{ env.VM_IP }}:8080 ..."
@@ -337,7 +356,6 @@ jobs:
           echo "❌ Frontend Angular non accessible après 60s"
           exit 1
 
-      # ── Résumé final ─────────────────────────────────────────────────────
       - name: 📋 Résumé du déploiement
         if: always()
         run: |
@@ -347,4 +365,59 @@ jobs:
           echo "╠══════════════════════════════════════════════════════╣"
           echo "║  Backend  (Spring Boot) → http://${{ env.VM_IP }}:8080  ║"
           echo "║  Frontend (Angular)     → http://${{ env.VM_IP }}:4200  ║"
+          echo "╚══════════════════════════════════════════════════════╝"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 4 — 🔴 Destruction de l'infrastructure (terraform destroy)
+# ════════════════════════════════════════════════════════════════════════════
+  job4_destroy:
+    name: "JOB 4 — 🔴 Terraform Destroy"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.destroy_infra == 'true' }}
+
+    steps:
+      - name: 📥 Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configuration credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: 🏗️ Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: 🔧 Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+
+      - name: 📋 Terraform Plan (destroy)
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          echo "⚠️ PLAN DE DESTRUCTION :"
+          terraform plan -destroy -out=tfplan-destroy
+
+      - name: 🔴 Terraform Destroy
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          echo "⚠️ DESTRUCTION DE L'INFRASTRUCTURE EN COURS..."
+          terraform apply -auto-approve tfplan-destroy
+
+      - name: 📋 Confirmation de destruction
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════╗"
+          echo "║     🔴 INFRASTRUCTURE DÉTRUITE                       ║"
+          echo "╠══════════════════════════════════════════════════════╣"
+          echo "║  ✗ Instance EC2 supprimée                            ║"
+          echo "║  ✗ Security Group supprimé                           ║"
+          echo "║                                                      ║"
+          echo "║  Pour re-déployer : relancer le pipeline             ║"
+          echo "║  avec destroy_infra = false                          ║"
           echo "╚══════════════════════════════════════════════════════╝"
