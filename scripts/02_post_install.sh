@@ -58,8 +58,8 @@ npm -v
 echo ""
 echo "[6/8] Téléchargement des archives GMAO..."
 cd ~
-wget -q --show-progress https://github.com/oumaimabennejma05-netizen/gmao-releases/releases/download/v1.0/gmao-backend.tar.gz
-wget -q --show-progress https://github.com/oumaimabennejma05-netizen/gmao-releases/releases/download/v1.0/gmao-frontend.tar.gz
+wget -q --show-progress http://n.grassa.free.fr/TD_devops/gmao-backend.tar.gz
+wget -q --show-progress http://n.grassa.free.fr/TD_devops/gmao-frontend.tar.gz
 echo "✅ Téléchargements terminés"
 
 # ── [7/8] Décompression ───────────────────────────────────────────────────────
