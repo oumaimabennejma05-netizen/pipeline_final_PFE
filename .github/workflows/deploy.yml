@@ -744,6 +744,59 @@ jobs:
           echo ""
           echo "⚠️  Vérifie tes emails et confirme l'abonnement SNS pour recevoir les alertes."
 
+      # ── Rapport périodique : métriques actuelles envoyées par email ──────
+      - name: 📊 Rapport périodique — métriques actuelles via SNS
+        run: |
+          INSTANCE_ID="${{ env.INSTANCE_ID }}"
+          REGION="${{ env.AWS_REGION }}"
+          TOPIC_ARN=$(aws sns list-topics --query "Topics[?ends_with(TopicArn,'gmao-alerts')].TopicArn" --output text)
+
+          # Récupérer les métriques actuelles depuis CloudWatch
+          CPU=$(aws cloudwatch get-metric-statistics             --namespace AWS/EC2             --metric-name CPUUtilization             --dimensions Name=InstanceId,Value=$INSTANCE_ID             --start-time $(date -u -d '5 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')             --end-time $(date -u '+%Y-%m-%dT%H:%M:%SZ')             --period 300 --statistics Average             --query 'Datapoints[0].Average' --output text 2>/dev/null || echo "N/A")
+
+          MEM=$(aws cloudwatch get-metric-statistics             --namespace GMAO/EC2             --metric-name mem_used_percent             --dimensions Name=InstanceId,Value=$INSTANCE_ID             --start-time $(date -u -d '5 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')             --end-time $(date -u '+%Y-%m-%dT%H:%M:%SZ')             --period 300 --statistics Average             --query 'Datapoints[0].Average' --output text 2>/dev/null || echo "N/A")
+
+          DISK=$(aws cloudwatch get-metric-statistics             --namespace GMAO/EC2             --metric-name disk_used_percent             --dimensions Name=InstanceId,Value=$INSTANCE_ID             --start-time $(date -u -d '5 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')             --end-time $(date -u '+%Y-%m-%dT%H:%M:%SZ')             --period 300 --statistics Average             --query 'Datapoints[0].Average' --output text 2>/dev/null || echo "N/A")
+
+          # Statut des services
+          BACKEND_STATUS=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}"             http://${{ env.VM_IP }}:8080 2>/dev/null || echo "DOWN")
+          FRONTEND_STATUS=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}"             http://${{ env.VM_IP }}:4200 2>/dev/null || echo "DOWN")
+
+          # Construire le message du rapport
+          MESSAGE="=== RAPPORT MONITORING GMAO ===
+Date       : $(date '+%d/%m/%Y %H:%M:%S')
+Instance   : $INSTANCE_ID
+Region     : $REGION
+
+--- METRIQUES SYSTEME ---
+CPU utilisation  : ${CPU}%
+Memoire utilisee : ${MEM}%
+Disque utilise   : ${DISK}%
+
+--- ETAT DES SERVICES ---
+Backend  (port 8080) : HTTP $BACKEND_STATUS
+Frontend (port 4200) : HTTP $FRONTEND_STATUS
+
+--- SEUILS D'ALARME ---
+CPU     > 80%  → ALARME
+Memoire > 85%  → ALARME
+Disque  > 90%  → ALARME
+
+--- ACCES ---
+Backend  : http://${{ env.VM_IP }}:8080
+Frontend : http://${{ env.VM_IP }}:4200
+Dashboard: https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard
+
+Logs complets : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Envoyer le rapport via SNS
+          if [ -n "$TOPIC_ARN" ]; then
+            aws sns publish               --topic-arn "$TOPIC_ARN"               --subject "📊 [GMAO] Rapport Monitoring — $(date '+%d/%m/%Y %H:%M')"               --message "$MESSAGE"
+            echo "✅ Rapport périodique envoyé via SNS"
+          else
+            echo "⚠️ Topic SNS introuvable — rapport non envoyé"
+          fi
+
 # ════════════════════════════════════════════════════════════════════════════
 #  JOB NOTIFICATION — Résumé final (toujours exécuté)
 # ════════════════════════════════════════════════════════════════════════════
@@ -763,7 +816,7 @@ jobs:
       JM_STATUS:  ${{ needs.job4_monitoring.result }}
 
     steps:
-      - name: 📋 Résumé complet du déploiement
+      - name: 📋 Résumé complet du déploiement (logs)
         run: |
           echo ""
           echo "╔══════════════════════════════════════════════════════════════════╗"
@@ -819,12 +872,88 @@ jobs:
           echo "║  Logs → ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "╚══════════════════════════════════════════════════════════════════╝"
 
-      - name: 🔗 Lien direct vers ce run GitHub Actions
+      - name: 📧 Envoi email résultat pipeline via Gmail SMTP
         run: |
-          echo ""
-          echo "🔗 Lien direct vers ce rapport :"
-          echo "   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo ""
+          # Déterminer statut et sujet
+          if [ "${{ needs.job1_create_vm.outputs.vm_skipped }}" = "true" ]; then
+            STATUT="♻️ VM DEJA ACTIVE — aucun deploiement effectue"
+            SUJET="[GMAO] ♻️ VM déjà active — $(date '+%d/%m/%Y %H:%M')"
+            EMOJI="♻️"
+          elif [ "${{ needs.job1_create_vm.result }}" = "success" ] &&                [ "${{ needs.job3_start_app.result }}" = "success" ]; then
+            STATUT="✅ DEPLOIEMENT REUSSI"
+            SUJET="[GMAO] ✅ Déploiement réussi — ${{ github.ref_name }}"
+            EMOJI="✅"
+          else
+            STATUT="❌ DEPLOIEMENT ECHOUE"
+            SUJET="[GMAO] ❌ Déploiement échoué — ${{ github.ref_name }}"
+            EMOJI="❌"
+          fi
+
+          # Corps de l'email
+          BODY="Bonjour,
+
+$EMOJI RAPPORT DE DEPLOIEMENT GMAO
+=====================================
+Date        : $(date '+%d/%m/%Y %H:%M:%S')
+Statut      : $STATUT
+Branche     : ${{ github.ref_name }}
+Commit      : ${{ github.sha }}
+Declenche   : ${{ github.actor }}
+
+STATUT DES JOBS
+---------------
+JOB 0 - Validation code : ${{ needs.job0_validate_code.result }}
+JOB 1 - VM EC2          : ${{ needs.job1_create_vm.result }}
+JOB 2 - Post-install    : ${{ needs.job2_post_install.result }}
+JOB 3 - Demarrage app   : ${{ needs.job3_start_app.result }}
+JOB 4 - Monitoring      : ${{ needs.job4_monitoring.result }}
+
+URLS DE L'APPLICATION
+---------------------
+Backend  : http://${{ needs.job1_create_vm.outputs.public_ip }}:8080
+Frontend : http://${{ needs.job1_create_vm.outputs.public_ip }}:4200
+SSH      : ssh -i labsuser.pem ubuntu@${{ needs.job1_create_vm.outputs.public_ip }}
+
+MONITORING
+----------
+Dashboard CloudWatch : https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard
+
+LOGS COMPLETS
+-------------
+${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+Cordialement,
+GitHub Actions — GMAO Pipeline"
+
+          # Installer msmtp
+          sudo apt-get install -y msmtp msmtp-mta -q
+
+          # Configuration msmtp Gmail
+          cat > ~/.msmtprc << MSMTP
+defaults
+auth           on
+tls            on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+logfile        ~/.msmtp.log
+
+account        gmail
+host           smtp.gmail.com
+port           587
+from           ${{ secrets.GMAIL_USER }}
+user           ${{ secrets.GMAIL_USER }}
+password       ${{ secrets.GMAIL_PASSWORD }}
+
+account default : gmail
+MSMTP
+          chmod 600 ~/.msmtprc
+
+          # Envoi de l'email
+          printf "To: oumaimabn.amelmm@gmail.com
+From: %s
+Subject: %s
+Content-Type: text/plain; charset=UTF-8
+
+%s"             "${{ secrets.GMAIL_USER }}" "$SUJET" "$BODY" |             msmtp "oumaimabn.amelmm@gmail.com" &&             echo "✅ Email résultat pipeline envoyé à oumaimabn.amelmm@gmail.com" ||             echo "❌ Échec envoi email — vérifiez GMAIL_USER et GMAIL_PASSWORD"
 
 # ════════════════════════════════════════════════════════════════════════════
 #  [DÉSACTIVÉ] — Terraform Destroy (commenté — remplacé par JOB 4 Monitoring)
