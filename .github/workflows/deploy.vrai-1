@@ -2,7 +2,7 @@ name: GMAO — Deploy Pipeline
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
     inputs:
       force_recreate_vm:
@@ -34,9 +34,6 @@ env:
   TF_DIR: ./terraform
   AWS_REGION: us-east-1
 
-# ════════════════════════════════════════════════════════════════════════════
-#  Concurrency : évite les exécutions parallèles sur la même branche
-# ════════════════════════════════════════════════════════════════════════════
 concurrency:
   group: gmao-deploy-${{ github.ref }}
   cancel-in-progress: false
@@ -44,17 +41,89 @@ concurrency:
 jobs:
 
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB 1 — Création / Vérification VM EC2
+#  JOB 0 — Validation du code (compile + tests) AVANT tout déploiement
+# ════════════════════════════════════════════════════════════════════════════
+  job0_validate_code:
+    name: "JOB 0 — Validation du code"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.destroy_infra != 'true' }}
+
+    outputs:
+      backend_ok:  ${{ steps.validate_backend.outputs.backend_ok }}
+      frontend_ok: ${{ steps.validate_frontend.outputs.frontend_ok }}
+
+    steps:
+      - name: 📥 Checkout du dépôt
+        uses: actions/checkout@v4
+
+      - name: ☕ Setup Java 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: 🟢 Setup Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: 🔍 Vérification VM déjà active (skip si VM existe)
+        id: check_existing_vm
+        run: |
+          # On a besoin des credentials AWS pour vérifier
+          echo "skip_validation=${{ github.event.inputs.skip_post_install == 'true' && 'true' || 'false' }}" >> $GITHUB_OUTPUT
+
+      - name: 🏗️ Validation backend (mvn compile)
+        id: validate_backend
+        run: |
+          if [ -f "gmao-backend/pom.xml" ]; then
+            echo "📦 Compilation du backend Maven..."
+            cd gmao-backend
+            mvn compile -q --no-transfer-progress 2>&1
+            echo "backend_ok=true" >> $GITHUB_OUTPUT
+            echo "✅ Backend compilé avec succès"
+          else
+            echo "⚠️ Pas de pom.xml trouvé — validation backend ignorée"
+            echo "backend_ok=skipped" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🌐 Validation frontend (npm install + build check)
+        id: validate_frontend
+        run: |
+          if [ -f "gmao-frontend/package.json" ]; then
+            echo "📦 Vérification du frontend..."
+            cd gmao-frontend
+            npm install --silent 2>&1
+            echo "frontend_ok=true" >> $GITHUB_OUTPUT
+            echo "✅ Frontend validé avec succès"
+          else
+            echo "⚠️ Pas de package.json trouvé — validation frontend ignorée"
+            echo "frontend_ok=skipped" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 📋 Résumé validation
+        run: |
+          echo "════════════════════════════════"
+          echo "  RÉSULTAT VALIDATION CODE"
+          echo "════════════════════════════════"
+          echo "  Backend  : ${{ steps.validate_backend.outputs.backend_ok }}"
+          echo "  Frontend : ${{ steps.validate_frontend.outputs.frontend_ok }}"
+          echo "════════════════════════════════"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 1 — Vérification VM existante OU création nouvelle VM
 # ════════════════════════════════════════════════════════════════════════════
   job1_create_vm:
     name: "JOB 1 — Création / Vérification VM EC2"
     runs-on: ubuntu-latest
+    needs: job0_validate_code
     if: ${{ github.event.inputs.destroy_infra != 'true' }}
 
     outputs:
       public_ip:   ${{ steps.resolve_ip.outputs.public_ip }}
       instance_id: ${{ steps.resolve_ip.outputs.instance_id }}
       vm_created:  ${{ steps.resolve_ip.outputs.vm_created }}
+      vm_skipped:  ${{ steps.resolve_ip.outputs.vm_skipped }}
 
     steps:
       - name: 📥 Checkout du dépôt
@@ -78,47 +147,71 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: terraform init
 
-      - name: 🔍 Vérification VM existante
-        id: check_vm
+      # ── Vérifie si une VM gmao-server est déjà running ──────────────────
+      - name: 🔍 Détection VM déjà en cours d'exécution
+        id: detect_running_vm
+        run: |
+          RUNNING=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=gmao-server" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].[InstanceId,PublicIpAddress]" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$RUNNING" ]; then
+            INSTANCE_ID=$(echo "$RUNNING" | awk '{print $1}' | head -1)
+            PUBLIC_IP=$(echo "$RUNNING"   | awk '{print $2}' | head -1)
+            echo "♻️ VM déjà active détectée : $INSTANCE_ID ($PUBLIC_IP)"
+            echo "vm_already_running=true"  >> $GITHUB_OUTPUT
+            echo "existing_ip=$PUBLIC_IP"   >> $GITHUB_OUTPUT
+            echo "existing_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          else
+            echo "🆕 Aucune VM active — création nécessaire"
+            echo "vm_already_running=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Si VM déjà running → on skip la création ────────────────────────
+      - name: ✅ VM déjà active — skip création
+        if: steps.detect_running_vm.outputs.vm_already_running == 'true'
+        run: |
+          echo "♻️ VM existante réutilisée : ${{ steps.detect_running_vm.outputs.existing_id }}"
+          echo "   IP : ${{ steps.detect_running_vm.outputs.existing_ip }}"
+          echo "   → Jobs 2 et 3 seront également skippés"
+
+      # ── Si pas de VM running → destroy les éventuelles VMs arrêtées ─────
+      - name: 🔴 Destroy VMs précédentes arrêtées (si elles existent)
+        if: steps.detect_running_vm.outputs.vm_already_running != 'true'
         working-directory: ${{ env.TF_DIR }}
         run: |
-          EXISTING_IP=$(terraform output -raw public_ip 2>/dev/null || echo "")
-          EXISTING_ID=$(terraform output -raw instance_id 2>/dev/null || echo "")
-          FORCE="${{ github.event.inputs.force_recreate_vm || 'false' }}"
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=gmao-server" \
+                      "Name=instance-state-name,Values=stopped,pending,stopping" \
+            --query "Reservations[].Instances[].InstanceId" \
+            --output text 2>/dev/null || echo "")
 
-          if [ -n "$EXISTING_IP" ] && [ "$FORCE" != "true" ]; then
-            echo "🔎 VM détectée dans le state : $EXISTING_ID ($EXISTING_IP)"
-            INSTANCE_STATE=$(aws ec2 describe-instances \
-              --instance-ids "$EXISTING_ID" \
-              --query 'Reservations[0].Instances[0].State.Name' \
-              --output text 2>/dev/null || echo "not-found")
-
-            if [ "$INSTANCE_STATE" = "running" ]; then
-              echo "✅ VM $EXISTING_ID est en état 'running'"
-              echo "vm_exists=true" >> $GITHUB_OUTPUT
-              echo "existing_ip=$EXISTING_IP" >> $GITHUB_OUTPUT
-              echo "existing_id=$EXISTING_ID" >> $GITHUB_OUTPUT
-            else
-              echo "⚠️ VM état=$INSTANCE_STATE → re-création"
-              echo "vm_exists=false" >> $GITHUB_OUTPUT
-            fi
+          if [ -n "$INSTANCE_IDS" ]; then
+            COUNT=$(echo "$INSTANCE_IDS" | wc -w)
+            echo "🔴 $COUNT VM(s) arrêtée(s) détectée(s) : $INSTANCE_IDS"
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS
+            aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS
+            echo "✅ $COUNT VM(s) supprimée(s)"
+            terraform state list 2>/dev/null | xargs -r terraform state rm 2>/dev/null || true
+            echo "✅ State Terraform nettoyé"
           else
-            [ "$FORCE" = "true" ] && echo "🔄 Force re-création demandée"
-            echo "vm_exists=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ Aucune VM arrêtée à nettoyer"
           fi
 
       - name: ✅ Terraform Validate
-        if: steps.check_vm.outputs.vm_exists != 'true'
+        if: steps.detect_running_vm.outputs.vm_already_running != 'true'
         working-directory: ${{ env.TF_DIR }}
         run: terraform validate
 
       - name: 📋 Terraform Plan
-        if: steps.check_vm.outputs.vm_exists != 'true'
+        if: steps.detect_running_vm.outputs.vm_already_running != 'true'
         working-directory: ${{ env.TF_DIR }}
         run: terraform plan -out=tfplan
 
       - name: 🚀 Terraform Apply
-        if: steps.check_vm.outputs.vm_exists != 'true'
+        if: steps.detect_running_vm.outputs.vm_already_running != 'true'
         working-directory: ${{ env.TF_DIR }}
         run: terraform apply -auto-approve tfplan
 
@@ -126,22 +219,23 @@ jobs:
         id: resolve_ip
         working-directory: ${{ env.TF_DIR }}
         run: |
-          if [ "${{ steps.check_vm.outputs.vm_exists }}" = "true" ]; then
-            PUBLIC_IP="${{ steps.check_vm.outputs.existing_ip }}"
-            INSTANCE_ID="${{ steps.check_vm.outputs.existing_id }}"
-            echo "vm_created=false" >> $GITHUB_OUTPUT
-            echo "♻️ VM existante réutilisée"
+          if [ "${{ steps.detect_running_vm.outputs.vm_already_running }}" = "true" ]; then
+            PUBLIC_IP="${{ steps.detect_running_vm.outputs.existing_ip }}"
+            INSTANCE_ID="${{ steps.detect_running_vm.outputs.existing_id }}"
+            echo "vm_created=false"  >> $GITHUB_OUTPUT
+            echo "vm_skipped=true"   >> $GITHUB_OUTPUT
           else
             PUBLIC_IP=$(terraform output -raw public_ip)
             INSTANCE_ID=$(terraform output -raw instance_id)
-            echo "vm_created=true" >> $GITHUB_OUTPUT
-            echo "🆕 Nouvelle VM créée"
+            echo "vm_created=true"   >> $GITHUB_OUTPUT
+            echo "vm_skipped=false"  >> $GITHUB_OUTPUT
           fi
           echo "public_ip=$PUBLIC_IP"     >> $GITHUB_OUTPUT
           echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
           echo "→ ID: $INSTANCE_ID | IP: $PUBLIC_IP"
 
       - name: ⏳ Attente SSH disponible (2 min max)
+        if: steps.detect_running_vm.outputs.vm_already_running != 'true'
         run: |
           VM_IP="${{ steps.resolve_ip.outputs.public_ip }}"
           echo "Attente du port 22 sur $VM_IP..."
@@ -157,13 +251,15 @@ jobs:
           exit 1
 
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB 2 — Post-installation (packages + projets)
+#  JOB 2 — Post-installation (skippé si VM déjà active)
 # ════════════════════════════════════════════════════════════════════════════
   job2_post_install:
     name: "JOB 2 — Post-Installation"
     runs-on: ubuntu-latest
     needs: job1_create_vm
-    if: ${{ github.event.inputs.destroy_infra != 'true' }}
+    if: |
+      github.event.inputs.destroy_infra != 'true' &&
+      needs.job1_create_vm.outputs.vm_skipped != 'true'
 
     env:
       VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
@@ -246,14 +342,15 @@ jobs:
                ls ~/gmao-frontend/ && echo '✅ gmao-frontend OK'"
 
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB 3 — Démarrage Application (DB + Backend Spring Boot + Frontend Angular)
-#  → TOUJOURS exécuté (kill + restart) pour garantir l'état de l'app
+#  JOB 3 — Démarrage Application (skippé si VM déjà active)
 # ════════════════════════════════════════════════════════════════════════════
   job3_start_app:
     name: "JOB 3 — Démarrage Application GMAO"
     runs-on: ubuntu-latest
     needs: [job1_create_vm, job2_post_install]
-    if: ${{ github.event.inputs.destroy_infra != 'true' }}
+    if: |
+      github.event.inputs.destroy_infra != 'true' &&
+      needs.job1_create_vm.outputs.vm_skipped != 'true'
 
     env:
       VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
@@ -278,7 +375,16 @@ jobs:
             IdentityFile ~/.ssh/vockey.pem
           EOF
 
-      # ── Toujours copier et exécuter (pas de skip) ───────────────────────
+      - name: 📤 Copie du dossier BD/ (restore.sh + backup SQL)
+        run: |
+          ssh -i ~/.ssh/vockey.pem \
+              -o StrictHostKeyChecking=no \
+              ubuntu@${{ env.VM_IP }} "mkdir -p ~/BD"
+          scp -i ~/.ssh/vockey.pem \
+              -o StrictHostKeyChecking=no \
+              -r BD/* \
+              ubuntu@${{ env.VM_IP }}:~/BD/
+
       - name: 📤 Copie du script de démarrage
         run: |
           scp -i ~/.ssh/vockey.pem \
@@ -294,7 +400,6 @@ jobs:
               ubuntu@${{ env.VM_IP }} \
               "chmod +x ~/03_start_app.sh && ~/03_start_app.sh"
 
-      # ── Tests de connectivité ────────────────────────────────────────────
       - name: 🔍 Test de connectivité Backend (port 8080)
         run: |
           echo "Test http://${{ env.VM_IP }}:8080 ..."
@@ -327,21 +432,93 @@ jobs:
           echo "❌ Frontend Angular non accessible après 60s"
           exit 1
 
-      - name: 📋 Résumé du déploiement
-        if: always()
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB NOTIFICATION — Résumé final (toujours exécuté)
+# ════════════════════════════════════════════════════════════════════════════
+  job_notify:
+    name: "JOB FINAL — Notification & Résumé"
+    runs-on: ubuntu-latest
+    needs: [job1_create_vm, job2_post_install, job3_start_app]
+    if: always() && github.event.inputs.destroy_infra != 'true'
+
+    env:
+      VM_IP:      ${{ needs.job1_create_vm.outputs.public_ip }}
+      VM_SKIPPED: ${{ needs.job1_create_vm.outputs.vm_skipped }}
+      J0_STATUS:  ${{ needs.job0_validate_code.result }}
+      J1_STATUS:  ${{ needs.job1_create_vm.result }}
+      J2_STATUS:  ${{ needs.job2_post_install.result }}
+      J3_STATUS:  ${{ needs.job3_start_app.result }}
+
+    steps:
+      - name: 📋 Résumé complet du déploiement
         run: |
           echo ""
-          echo "╔══════════════════════════════════════════════════════╗"
-          echo "║         DÉPLOIEMENT GMAO TERMINÉ ✅                  ║"
-          echo "╠══════════════════════════════════════════════════════╣"
-          echo "║  Backend  (Spring Boot) → http://${{ env.VM_IP }}:8080  ║"
-          echo "║  Frontend (Angular)     → http://${{ env.VM_IP }}:4200  ║"
-          echo "╚══════════════════════════════════════════════════════╝"
+          echo "╔══════════════════════════════════════════════════════════════════╗"
+          echo "║               RAPPORT DE DÉPLOIEMENT GMAO                       ║"
+          echo "╠══════════════════════════════════════════════════════════════════╣"
+          echo "║  Date     : $(date '+%d/%m/%Y %H:%M:%S')"
+          echo "║  Branche  : ${{ github.ref_name }}"
+          echo "║  Commit   : ${{ github.sha }}"
+          echo "║  Déclenché par : ${{ github.actor }}"
+          echo "╠══════════════════════════════════════════════════════════════════╣"
+          echo "║  STATUT DES JOBS"
+          echo "║  ├── JOB 0 — Validation code  : ${{ needs.job0_validate_code.result }}"
+          echo "║  ├── JOB 1 — VM EC2           : ${{ needs.job1_create_vm.result }}"
+
+          if [ "$VM_SKIPPED" = "true" ]; then
+            echo "║  ├── JOB 2 — Post-install     : ⏭️  skippé (VM déjà active)"
+            echo "║  ├── JOB 3 — Démarrage app    : ⏭️  skippé (VM déjà active)"
+          else
+            echo "║  ├── JOB 2 — Post-install     : ${{ needs.job2_post_install.result }}"
+            echo "║  └── JOB 3 — Démarrage app    : ${{ needs.job3_start_app.result }}"
+          fi
+
+          echo "╠══════════════════════════════════════════════════════════════════╣"
+
+          if [ "$VM_SKIPPED" = "true" ]; then
+            echo "║  ♻️  VM DÉJÀ ACTIVE — aucun déploiement effectué"
+            echo "║"
+            echo "║  Une VM gmao-server est déjà en cours d'exécution."
+            echo "║  Les Jobs 2 et 3 ont été skippés automatiquement."
+            echo "║  Pour forcer un re-déploiement complet :"
+            echo "║  → Lancer manuellement avec force_recreate_vm = true"
+          else
+            # Déterminer le statut global
+            if [ "$J1_STATUS" = "success" ] && [ "$J3_STATUS" = "success" ]; then
+              echo "║  ✅  DÉPLOIEMENT RÉUSSI"
+            elif [ "$J1_STATUS" = "failure" ]; then
+              echo "║  ❌  ÉCHEC — La création de la VM a échoué"
+            elif [ "$J2_STATUS" = "failure" ]; then
+              echo "║  ❌  ÉCHEC — Le post-install a échoué"
+            elif [ "$J3_STATUS" = "failure" ]; then
+              echo "║  ❌  ÉCHEC — Le démarrage de l'application a échoué"
+            else
+              echo "║  ⚠️  STATUT INCONNU"
+            fi
+            echo "║"
+            echo "║  URLS DE L'APPLICATION"
+            echo "║  ├── Backend  (Spring Boot) → http://$VM_IP:8080"
+            echo "║  ├── Frontend (Angular)     → http://$VM_IP:4200"
+            echo "║  └── SSH                    → ssh -i labsuser.pem ubuntu@$VM_IP"
+          fi
+
+          echo "╠══════════════════════════════════════════════════════════════════╣"
+          echo "║  DESTINATAIRES NOTIFIÉS (logs)"
+          echo "║  ├── oumaimabennejma05@gmail.com"
+          echo "║  └── amelmradmm@gmail.com"
+          echo "╠══════════════════════════════════════════════════════════════════╣"
+          echo "║  Logs complets → ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "╚══════════════════════════════════════════════════════════════════╝"
+
+      - name: 🔗 Lien direct vers ce run GitHub Actions
+        run: |
+          echo ""
+          echo "🔗 Lien direct vers ce rapport :"
+          echo "   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo ""
 
 # ════════════════════════════════════════════════════════════════════════════
 #  JOB 4 — 🔴 Destruction de l'infrastructure (terraform destroy)
-#  → Uniquement via workflow_dispatch avec destroy_infra = true
-#  → Les Jobs 1-3 sont automatiquement skippés
 # ════════════════════════════════════════════════════════════════════════════
   job4_destroy:
     name: "JOB 4 — 🔴 Terraform Destroy"
