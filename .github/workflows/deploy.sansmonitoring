@@ -70,6 +70,7 @@ jobs:
       - name: 🔍 Vérification VM déjà active (skip si VM existe)
         id: check_existing_vm
         run: |
+          # On a besoin des credentials AWS pour vérifier
           echo "skip_validation=${{ github.event.inputs.skip_post_install == 'true' && 'true' || 'false' }}" >> $GITHUB_OUTPUT
 
       - name: 🏗️ Validation backend (mvn compile)
@@ -146,6 +147,7 @@ jobs:
         working-directory: ${{ env.TF_DIR }}
         run: terraform init
 
+      # ── Vérifie si une VM gmao-server est déjà running ──────────────────
       - name: 🔍 Détection VM déjà en cours d'exécution
         id: detect_running_vm
         run: |
@@ -167,6 +169,7 @@ jobs:
             echo "vm_already_running=false" >> $GITHUB_OUTPUT
           fi
 
+      # ── Si VM déjà running → on skip la création ────────────────────────
       - name: ✅ VM déjà active — skip création
         if: steps.detect_running_vm.outputs.vm_already_running == 'true'
         run: |
@@ -174,6 +177,7 @@ jobs:
           echo "   IP : ${{ steps.detect_running_vm.outputs.existing_ip }}"
           echo "   → Jobs 2 et 3 seront également skippés"
 
+      # ── Si pas de VM running → destroy les éventuelles VMs arrêtées ─────
       - name: 🔴 Destroy VMs précédentes arrêtées (si elles existent)
         if: steps.detect_running_vm.outputs.vm_already_running != 'true'
         working-directory: ${{ env.TF_DIR }}
@@ -429,334 +433,12 @@ jobs:
           exit 1
 
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB MONITORING — CloudWatch (santé, métriques, logs)
-#  → Exécuté après Job 3, skippé si VM déjà active
-# ════════════════════════════════════════════════════════════════════════════
-  job_monitoring:
-    name: "JOB MONITORING — CloudWatch"
-    runs-on: ubuntu-latest
-    needs: [job1_create_vm, job3_start_app]
-    if: |
-      always() &&
-      github.event.inputs.destroy_infra != 'true' &&
-      needs.job1_create_vm.outputs.vm_skipped != 'true' &&
-      needs.job3_start_app.result == 'success'
-
-    env:
-      VM_IP:       ${{ needs.job1_create_vm.outputs.public_ip }}
-      INSTANCE_ID: ${{ needs.job1_create_vm.outputs.instance_id }}
-
-    steps:
-      - name: 📥 Checkout du dépôt
-        uses: actions/checkout@v4
-
-      - name: 🔑 Configuration credentials AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region:            ${{ env.AWS_REGION }}
-
-      - name: 🔑 Configuration clé SSH (vockey)
-        run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
-          chmod 600 ~/.ssh/vockey.pem
-          cat >> ~/.ssh/config <<EOF
-          Host *
-            StrictHostKeyChecking no
-            UserKnownHostsFile /dev/null
-            IdentityFile ~/.ssh/vockey.pem
-          EOF
-
-      # ── Installation CloudWatch Agent sur la VM ──────────────────────────
-      - name: 📦 Installation du CloudWatch Agent sur la VM
-        run: |
-          ssh -i ~/.ssh/vockey.pem ubuntu@${{ env.VM_IP }} << 'SSHEOF'
-            echo "=== Installation CloudWatch Agent ==="
-            # Téléchargement de l'agent
-            wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
-            sudo dpkg -i amazon-cloudwatch-agent.deb
-            rm -f amazon-cloudwatch-agent.deb
-            echo "✅ CloudWatch Agent installé"
-          SSHEOF
-
-      # ── Création et copie de la config CloudWatch ────────────────────────
-      - name: 📝 Configuration CloudWatch (métriques + logs)
-        run: |
-          # Créer le fichier de config localement
-          cat > /tmp/cloudwatch-config.json << 'CONFIG'
-          {
-            "agent": {
-              "metrics_collection_interval": 60,
-              "run_as_user": "root"
-            },
-            "metrics": {
-              "namespace": "GMAO/EC2",
-              "append_dimensions": {
-                "InstanceId": "${aws:InstanceId}"
-              },
-              "metrics_collected": {
-                "cpu": {
-                  "measurement": ["cpu_usage_idle", "cpu_usage_user", "cpu_usage_system"],
-                  "metrics_collection_interval": 60,
-                  "totalcpu": true
-                },
-                "mem": {
-                  "measurement": ["mem_used_percent", "mem_available"],
-                  "metrics_collection_interval": 60
-                },
-                "disk": {
-                  "measurement": ["used_percent", "free"],
-                  "metrics_collection_interval": 60,
-                  "resources": ["/"]
-                }
-              }
-            },
-            "logs": {
-              "logs_collected": {
-                "files": {
-                  "collect_list": [
-                    {
-                      "file_path": "/home/ubuntu/backend.log",
-                      "log_group_name": "/gmao/backend",
-                      "log_stream_name": "{instance_id}",
-                      "timezone": "UTC"
-                    },
-                    {
-                      "file_path": "/home/ubuntu/frontend.log",
-                      "log_group_name": "/gmao/frontend",
-                      "log_stream_name": "{instance_id}",
-                      "timezone": "UTC"
-                    },
-                    {
-                      "file_path": "/var/log/syslog",
-                      "log_group_name": "/gmao/system",
-                      "log_stream_name": "{instance_id}",
-                      "timezone": "UTC"
-                    }
-                  ]
-                }
-              }
-            }
-          }
-          CONFIG
-
-          # Copier la config sur la VM
-          scp -i ~/.ssh/vockey.pem \
-              /tmp/cloudwatch-config.json \
-              ubuntu@${{ env.VM_IP }}:/tmp/cloudwatch-config.json
-
-          # Démarrer l'agent avec la config
-          ssh -i ~/.ssh/vockey.pem ubuntu@${{ env.VM_IP }} << 'SSHEOF'
-            sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
-            sudo cp /tmp/cloudwatch-config.json /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
-            sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-              -a fetch-config \
-              -m ec2 \
-              -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
-              -s
-            echo "✅ CloudWatch Agent démarré"
-            sudo systemctl enable amazon-cloudwatch-agent
-            sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status
-          SSHEOF
-
-      # ── Création topic SNS + abonnements emails ──────────────────────────
-      - name: 📧 Création topic SNS pour les alertes email
-        run: |
-          # Créer le topic SNS
-          TOPIC_ARN=$(aws sns create-topic \
-            --name gmao-alerts \
-            --query 'TopicArn' \
-            --output text)
-          echo "✅ Topic SNS créé : $TOPIC_ARN"
-          echo "TOPIC_ARN=$TOPIC_ARN" >> $GITHUB_ENV
-
-          # Abonner les deux emails
-          aws sns subscribe \
-            --topic-arn "$TOPIC_ARN" \
-            --protocol email \
-            --notification-endpoint "oumaimabennejma05@gmail.com"
-
-          aws sns subscribe \
-            --topic-arn "$TOPIC_ARN" \
-            --protocol email \
-            --notification-endpoint "amelmradmm@gmail.com"
-
-          echo "✅ Abonnements email créés (confirmation requise par email)"
-
-      # ── Création des alarmes CloudWatch ─────────────────────────────────
-      - name: 🚨 Création des alarmes CloudWatch
-        run: |
-          INSTANCE_ID="${{ env.INSTANCE_ID }}"
-          TOPIC_ARN="${{ env.TOPIC_ARN }}"
-
-          # Alarme CPU > 80% pendant 5 minutes
-          aws cloudwatch put-metric-alarm \
-            --alarm-name "gmao-cpu-high" \
-            --alarm-description "CPU EC2 GMAO > 80%" \
-            --metric-name CPUUtilization \
-            --namespace AWS/EC2 \
-            --statistic Average \
-            --dimensions Name=InstanceId,Value=$INSTANCE_ID \
-            --period 300 \
-            --evaluation-periods 1 \
-            --threshold 80 \
-            --comparison-operator GreaterThanThreshold \
-            --alarm-actions "$TOPIC_ARN" \
-            --ok-actions "$TOPIC_ARN"
-          echo "✅ Alarme CPU créée"
-
-          # Alarme mémoire > 85%
-          aws cloudwatch put-metric-alarm \
-            --alarm-name "gmao-memory-high" \
-            --alarm-description "Mémoire EC2 GMAO > 85%" \
-            --metric-name mem_used_percent \
-            --namespace GMAO/EC2 \
-            --statistic Average \
-            --dimensions Name=InstanceId,Value=$INSTANCE_ID \
-            --period 300 \
-            --evaluation-periods 1 \
-            --threshold 85 \
-            --comparison-operator GreaterThanThreshold \
-            --alarm-actions "$TOPIC_ARN" \
-            --ok-actions "$TOPIC_ARN"
-          echo "✅ Alarme mémoire créée"
-
-          # Alarme disque > 90%
-          aws cloudwatch put-metric-alarm \
-            --alarm-name "gmao-disk-full" \
-            --alarm-description "Disque EC2 GMAO > 90%" \
-            --metric-name disk_used_percent \
-            --namespace GMAO/EC2 \
-            --statistic Average \
-            --dimensions Name=InstanceId,Value=$INSTANCE_ID \
-            --period 300 \
-            --evaluation-periods 1 \
-            --threshold 90 \
-            --comparison-operator GreaterThanThreshold \
-            --alarm-actions "$TOPIC_ARN" \
-            --ok-actions "$TOPIC_ARN"
-          echo "✅ Alarme disque créée"
-
-          echo ""
-          echo "=== Alarmes CloudWatch configurées ==="
-          aws cloudwatch describe-alarms \
-            --alarm-name-prefix "gmao-" \
-            --query 'MetricAlarms[].{Nom:AlarmName,Etat:StateValue}' \
-            --output table
-
-      # ── Création du dashboard CloudWatch ────────────────────────────────
-      - name: 📊 Création du dashboard CloudWatch GMAO
-        run: |
-          INSTANCE_ID="${{ env.INSTANCE_ID }}"
-          REGION="${{ env.AWS_REGION }}"
-
-          DASHBOARD=$(cat << DASH
-          {
-            "widgets": [
-              {
-                "type": "metric",
-                "x": 0, "y": 0, "width": 12, "height": 6,
-                "properties": {
-                  "title": "CPU Utilization (%)",
-                  "metrics": [["AWS/EC2","CPUUtilization","InstanceId","$INSTANCE_ID"]],
-                  "period": 60, "stat": "Average", "region": "$REGION",
-                  "view": "timeSeries"
-                }
-              },
-              {
-                "type": "metric",
-                "x": 12, "y": 0, "width": 12, "height": 6,
-                "properties": {
-                  "title": "Mémoire utilisée (%)",
-                  "metrics": [["GMAO/EC2","mem_used_percent","InstanceId","$INSTANCE_ID"]],
-                  "period": 60, "stat": "Average", "region": "$REGION",
-                  "view": "timeSeries"
-                }
-              },
-              {
-                "type": "metric",
-                "x": 0, "y": 6, "width": 12, "height": 6,
-                "properties": {
-                  "title": "Disque utilisé (%)",
-                  "metrics": [["GMAO/EC2","disk_used_percent","InstanceId","$INSTANCE_ID"]],
-                  "period": 300, "stat": "Average", "region": "$REGION",
-                  "view": "timeSeries"
-                }
-              },
-              {
-                "type": "metric",
-                "x": 12, "y": 6, "width": 12, "height": 6,
-                "properties": {
-                  "title": "Trafic réseau (bytes)",
-                  "metrics": [
-                    ["AWS/EC2","NetworkIn","InstanceId","$INSTANCE_ID"],
-                    ["AWS/EC2","NetworkOut","InstanceId","$INSTANCE_ID"]
-                  ],
-                  "period": 60, "stat": "Sum", "region": "$REGION",
-                  "view": "timeSeries"
-                }
-              },
-              {
-                "type": "log",
-                "x": 0, "y": 12, "width": 24, "height": 6,
-                "properties": {
-                  "title": "Logs Backend Spring Boot (dernières entrées)",
-                  "query": "SOURCE '/gmao/backend' | fields @timestamp, @message | sort @timestamp desc | limit 20",
-                  "region": "$REGION",
-                  "view": "table"
-                }
-              }
-            ]
-          }
-          DASH
-          )
-
-          aws cloudwatch put-dashboard \
-            --dashboard-name "GMAO-Dashboard" \
-            --dashboard-body "$DASHBOARD"
-          echo "✅ Dashboard CloudWatch créé"
-
-      # ── Résumé monitoring ────────────────────────────────────────────────
-      - name: 📋 Résumé du monitoring
-        run: |
-          echo ""
-          echo "╔══════════════════════════════════════════════════════════════════╗"
-          echo "║              MONITORING CLOUDWATCH CONFIGURÉ ✅                  ║"
-          echo "╠══════════════════════════════════════════════════════════════════╣"
-          echo "║  Métriques collectées (toutes les 60s)"
-          echo "║  ├── CPU utilization"
-          echo "║  ├── Mémoire utilisée (%)"
-          echo "║  └── Espace disque (%)"
-          echo "║"
-          echo "║  Logs collectés"
-          echo "║  ├── /gmao/backend  ← ~/backend.log"
-          echo "║  ├── /gmao/frontend ← ~/frontend.log"
-          echo "║  └── /gmao/system   ← /var/log/syslog"
-          echo "║"
-          echo "║  Alarmes actives"
-          echo "║  ├── gmao-cpu-high    (seuil : 80%)"
-          echo "║  ├── gmao-memory-high (seuil : 85%)"
-          echo "║  └── gmao-disk-full   (seuil : 90%)"
-          echo "║"
-          echo "║  Alertes email → oumaimabennejma05@gmail.com"
-          echo "║                  amelmradmm@gmail.com"
-          echo "╠══════════════════════════════════════════════════════════════════╣"
-          echo "║  Dashboard → https://console.aws.amazon.com/cloudwatch/home"
-          echo "║              #dashboards:name=GMAO-Dashboard"
-          echo "╚══════════════════════════════════════════════════════════════════╝"
-          echo ""
-          echo "⚠️  Vérifie tes emails et confirme l'abonnement SNS pour recevoir les alertes."
-
-# ════════════════════════════════════════════════════════════════════════════
 #  JOB NOTIFICATION — Résumé final (toujours exécuté)
 # ════════════════════════════════════════════════════════════════════════════
   job_notify:
     name: "JOB FINAL — Notification & Résumé"
     runs-on: ubuntu-latest
-    needs: [job1_create_vm, job2_post_install, job3_start_app, job_monitoring]
+    needs: [job1_create_vm, job2_post_install, job3_start_app]
     if: always() && github.event.inputs.destroy_infra != 'true'
 
     env:
@@ -766,7 +448,6 @@ jobs:
       J1_STATUS:  ${{ needs.job1_create_vm.result }}
       J2_STATUS:  ${{ needs.job2_post_install.result }}
       J3_STATUS:  ${{ needs.job3_start_app.result }}
-      JM_STATUS:  ${{ needs.job_monitoring.result }}
 
     steps:
       - name: 📋 Résumé complet du déploiement
@@ -775,9 +456,9 @@ jobs:
           echo "╔══════════════════════════════════════════════════════════════════╗"
           echo "║               RAPPORT DE DÉPLOIEMENT GMAO                       ║"
           echo "╠══════════════════════════════════════════════════════════════════╣"
-          echo "║  Date          : $(date '+%d/%m/%Y %H:%M:%S')"
-          echo "║  Branche       : ${{ github.ref_name }}"
-          echo "║  Commit        : ${{ github.sha }}"
+          echo "║  Date     : $(date '+%d/%m/%Y %H:%M:%S')"
+          echo "║  Branche  : ${{ github.ref_name }}"
+          echo "║  Commit   : ${{ github.sha }}"
           echo "║  Déclenché par : ${{ github.actor }}"
           echo "╠══════════════════════════════════════════════════════════════════╣"
           echo "║  STATUT DES JOBS"
@@ -787,19 +468,22 @@ jobs:
           if [ "$VM_SKIPPED" = "true" ]; then
             echo "║  ├── JOB 2 — Post-install     : ⏭️  skippé (VM déjà active)"
             echo "║  ├── JOB 3 — Démarrage app    : ⏭️  skippé (VM déjà active)"
-            echo "║  ├── JOB M — Monitoring       : ⏭️  skippé (VM déjà active)"
           else
             echo "║  ├── JOB 2 — Post-install     : ${{ needs.job2_post_install.result }}"
-            echo "║  ├── JOB 3 — Démarrage app    : ${{ needs.job3_start_app.result }}"
-            echo "║  └── JOB M — Monitoring       : ${{ needs.job_monitoring.result }}"
+            echo "║  └── JOB 3 — Démarrage app    : ${{ needs.job3_start_app.result }}"
           fi
 
           echo "╠══════════════════════════════════════════════════════════════════╣"
 
           if [ "$VM_SKIPPED" = "true" ]; then
             echo "║  ♻️  VM DÉJÀ ACTIVE — aucun déploiement effectué"
-            echo "║  Pour forcer un re-déploiement : force_recreate_vm = true"
+            echo "║"
+            echo "║  Une VM gmao-server est déjà en cours d'exécution."
+            echo "║  Les Jobs 2 et 3 ont été skippés automatiquement."
+            echo "║  Pour forcer un re-déploiement complet :"
+            echo "║  → Lancer manuellement avec force_recreate_vm = true"
           else
+            # Déterminer le statut global
             if [ "$J1_STATUS" = "success" ] && [ "$J3_STATUS" = "success" ]; then
               echo "║  ✅  DÉPLOIEMENT RÉUSSI"
             elif [ "$J1_STATUS" = "failure" ]; then
@@ -816,13 +500,14 @@ jobs:
             echo "║  ├── Backend  (Spring Boot) → http://$VM_IP:8080"
             echo "║  ├── Frontend (Angular)     → http://$VM_IP:4200"
             echo "║  └── SSH                    → ssh -i labsuser.pem ubuntu@$VM_IP"
-            echo "║"
-            echo "║  MONITORING"
-            echo "║  └── Dashboard → CloudWatch → GMAO-Dashboard"
           fi
 
           echo "╠══════════════════════════════════════════════════════════════════╣"
-          echo "║  Logs → ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "║  DESTINATAIRES NOTIFIÉS (logs)"
+          echo "║  ├── oumaimabennejma05@gmail.com"
+          echo "║  └── amelmradmm@gmail.com"
+          echo "╠══════════════════════════════════════════════════════════════════╣"
+          echo "║  Logs complets → ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "╚══════════════════════════════════════════════════════════════════╝"
 
       - name: 🔗 Lien direct vers ce run GitHub Actions
