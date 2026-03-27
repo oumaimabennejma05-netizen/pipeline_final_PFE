@@ -577,12 +577,7 @@ jobs:
           aws sns subscribe \
             --topic-arn "$TOPIC_ARN" \
             --protocol email \
-            --notification-endpoint "oumaimabennejma05@gmail.com"
-
-          aws sns subscribe \
-            --topic-arn "$TOPIC_ARN" \
-            --protocol email \
-            --notification-endpoint "amelmradmm@gmail.com"
+            --notification-endpoint "oumaimabn.amelmm@gmail.com"
 
           echo "✅ Abonnements email créés (confirmation requise par email)"
 
@@ -741,8 +736,7 @@ jobs:
           echo "║  ├── gmao-memory-high (seuil : 85%)"
           echo "║  └── gmao-disk-full   (seuil : 90%)"
           echo "║"
-          echo "║  Alertes email → oumaimabennejma05@gmail.com"
-          echo "║                  amelmradmm@gmail.com"
+          echo "║  Alertes email → oumaimabn.amelmm@gmail.com"
           echo "╠══════════════════════════════════════════════════════════════════╣"
           echo "║  Dashboard → https://console.aws.amazon.com/cloudwatch/home"
           echo "║              #dashboards:name=GMAO-Dashboard"
