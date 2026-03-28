@@ -1,4 +1,4 @@
-name: GMAO — Deploy Pipeline
+name: GMAO - Deploy Pipeline
 
 on:
   push:
@@ -167,7 +167,7 @@ jobs:
             echo "vm_already_running=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: ✅ VM déjà active — skip création
+      - name: "✅ VM déjà active - skip création"
         if: steps.detect_running_vm.outputs.vm_already_running == 'true'
         run: |
           echo "♻️ VM existante réutilisée : ${{ steps.detect_running_vm.outputs.existing_id }}"
@@ -273,12 +273,12 @@ jobs:
             echo "❌ Clé SSH invalide — vérifiez le secret SSH_PRIVATE_KEY"
             exit 1
           }
-          cat >> ~/.ssh/config <<EOF
-          Host *
-            StrictHostKeyChecking no
-            UserKnownHostsFile /dev/null
-            IdentityFile ~/.ssh/vockey.pem
-          EOF
+          cat >> ~/.ssh/config << 'SSHCFG'
+Host *
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  IdentityFile ~/.ssh/vockey.pem
+SSHCFG
 
       - name: 🔍 Vérification installations existantes
         id: check_install
@@ -364,12 +364,12 @@ jobs:
             echo "❌ Clé SSH invalide — vérifiez le secret SSH_PRIVATE_KEY"
             exit 1
           }
-          cat >> ~/.ssh/config <<EOF
-          Host *
-            StrictHostKeyChecking no
-            UserKnownHostsFile /dev/null
-            IdentityFile ~/.ssh/vockey.pem
-          EOF
+          cat >> ~/.ssh/config << 'SSHCFG'
+Host *
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  IdentityFile ~/.ssh/vockey.pem
+SSHCFG
 
       - name: 📤 Copie du dossier BD/ (restore.sh + backup SQL)
         run: |
@@ -463,12 +463,12 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
           chmod 600 ~/.ssh/vockey.pem
-          cat >> ~/.ssh/config <<EOF
-          Host *
-            StrictHostKeyChecking no
-            UserKnownHostsFile /dev/null
-            IdentityFile ~/.ssh/vockey.pem
-          EOF
+          cat >> ~/.ssh/config << 'SSHCFG'
+Host *
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  IdentityFile ~/.ssh/vockey.pem
+SSHCFG
 
       # ── Installation CloudWatch Agent sur la VM ──────────────────────────
       - name: 📦 Installation du CloudWatch Agent sur la VM
@@ -769,7 +769,7 @@ jobs:
           echo "⚠️  Vérifie tes emails et confirme l'abonnement SNS pour recevoir les alertes."
 
       # ── Rapport périodique : métriques actuelles envoyées par email ──────
-      - name: 📊 Rapport périodique — métriques actuelles via SNS
+      - name: "📊 Rapport périodique - métriques actuelles via SNS"
         run: |
           INSTANCE_ID="${{ env.INSTANCE_ID }}"
           REGION="${{ env.AWS_REGION }}"
