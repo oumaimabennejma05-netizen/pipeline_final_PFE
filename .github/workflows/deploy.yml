@@ -713,35 +713,12 @@ jobs:
           FRONTEND_STATUS=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
             http://${{ env.VM_IP }}:4200 2>/dev/null || echo "DOWN")
 
-          MESSAGE="RAPPORT MONITORING GMAO
-Date       : $(date '+%d/%m/%Y %H:%M:%S')
-Instance   : $INSTANCE_ID
-
-METRIQUES SYSTEME
-CPU          : ${CPU}%
-Memoire      : ${MEM}%
-Disque       : ${DISK}%
-
-ETAT DES SERVICES
-Backend  8080 : HTTP $BACKEND_STATUS
-Frontend 4200 : HTTP $FRONTEND_STATUS
-
-SEUILS ALARME
-CPU     > 80%
-Memoire > 85%
-Disque  > 90%
-
-ACCES
-Backend   : http://${{ env.VM_IP }}:8080
-Frontend  : http://${{ env.VM_IP }}:4200
-Dashboard : https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard
-Logs      : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
           if [ -n "$TOPIC_ARN" ]; then
+            MSG="RAPPORT MONITORING GMAO | Date: $(date '+%d/%m/%Y %H:%M:%S') | Instance: $INSTANCE_ID | CPU: ${CPU}% | Memoire: ${MEM}% | Disque: ${DISK}% | Backend HTTP: $BACKEND_STATUS | Frontend HTTP: $FRONTEND_STATUS | Backend: http://$VM_IP:8080 | Frontend: http://$VM_IP:4200 | Dashboard: https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard"
             aws sns publish \
               --topic-arn "$TOPIC_ARN" \
               --subject "[GMAO] Rapport Monitoring $(date '+%d/%m/%Y %H:%M')" \
-              --message "$MESSAGE"
+              --message "$MSG"
             echo "Rapport envoye via SNS"
           else
             echo "Topic SNS introuvable"
@@ -826,59 +803,26 @@ Logs      : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ g
             SUJET="[GMAO] Deploiement echoue — ${{ github.ref_name }}"
           fi
 
-          BODY="Bonjour,
-
-RAPPORT DE DEPLOIEMENT GMAO
-============================
-Date      : $(date '+%d/%m/%Y %H:%M:%S')
-Statut    : $STATUT
-Branche   : ${{ github.ref_name }}
-Commit    : ${{ github.sha }}
-Auteur    : ${{ github.actor }}
-
-STATUT DES JOBS
----------------
-JOB 0 - Validation code : ${{ needs.job0_validate_code.result }}
-JOB 1 - VM EC2          : ${{ needs.job1_create_vm.result }}
-JOB 2 - Post-install    : ${{ needs.job2_post_install.result }}
-JOB 3 - Demarrage app   : ${{ needs.job3_start_app.result }}
-JOB 4 - Monitoring      : ${{ needs.job4_monitoring.result }}
-
-URLS DE L APPLICATION
----------------------
-Backend  : http://${{ needs.job1_create_vm.outputs.public_ip }}:8080
-Frontend : http://${{ needs.job1_create_vm.outputs.public_ip }}:4200
-SSH      : ssh -i labsuser.pem ubuntu@${{ needs.job1_create_vm.outputs.public_ip }}
-
-MONITORING
-----------
-Dashboard : https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard
-
-LOGS
-----
-${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-Cordialement,
-GitHub Actions — GMAO Pipeline"
+          BODY="Bonjour, RAPPORT DEPLOIEMENT GMAO - Date: $(date '+%d/%m/%Y %H:%M:%S') - Statut: $STATUT - Branche: $GITHUB_REF_NAME - Commit: $GITHUB_SHA - Auteur: $GITHUB_ACTOR - JOB0: $J0_STATUS - JOB1: $J1_STATUS - JOB2: $J2_STATUS - JOB3: $J3_STATUS - JOB4: $JM_STATUS - Backend: http://$VM_IP:8080 - Frontend: http://$VM_IP:4200 - SSH: ubuntu@$VM_IP - Dashboard: https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard - Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
           sudo apt-get install -y msmtp msmtp-mta -q
 
-          cat > ~/.msmtprc << MSMTP
-defaults
-auth           on
-tls            on
-tls_trust_file /etc/ssl/certs/ca-certificates.crt
-logfile        ~/.msmtp.log
-
-account        gmail
-host           smtp.gmail.com
-port           587
-from           ${{ secrets.GMAIL_USER }}
-user           ${{ secrets.GMAIL_USER }}
-password       ${{ secrets.GMAIL_PASSWORD }}
-
-account default : gmail
-MSMTP
+          {
+            echo "defaults"
+            echo "auth on"
+            echo "tls on"
+            echo "tls_trust_file /etc/ssl/certs/ca-certificates.crt"
+            echo "logfile ~/.msmtp.log"
+            echo ""
+            echo "account gmail"
+            echo "host smtp.gmail.com"
+            echo "port 587"
+            echo "from ${{ secrets.GMAIL_USER }}"
+            echo "user ${{ secrets.GMAIL_USER }}"
+            echo "password ${{ secrets.GMAIL_PASSWORD }}"
+            echo ""
+            echo "account default : gmail"
+          } > ~/.msmtprc
           chmod 600 ~/.msmtprc
 
           printf "To: oumaimabn.amelmm@gmail.com\nFrom: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s" \
