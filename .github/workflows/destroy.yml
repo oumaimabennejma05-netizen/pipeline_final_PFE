@@ -1,0 +1,370 @@
+name: GMAO - Destroy Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_destroy:
+        description: "Tapez DESTROY pour confirmer la destruction"
+        required: true
+        type: string
+      cleanup_cloudwatch:
+        description: "Supprimer aussi les ressources CloudWatch (alarmes, dashboard, logs)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      cleanup_sns:
+        description: "Supprimer le topic SNS (gmao-alerts)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+env:
+  TF_DIR: ./terraform
+  AWS_REGION: us-east-1
+
+concurrency:
+  group: gmao-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 1 — Validation de la confirmation
+# ════════════════════════════════════════════════════════════════════════════
+  job1_confirm:
+    name: "JOB 1 — Validation confirmation"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verification du mot de confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm_destroy }}" != "DESTROY" ]; then
+            echo "ANNULE — Vous devez taper exactement DESTROY pour confirmer"
+            echo "Vous avez saisi : ${{ github.event.inputs.confirm_destroy }}"
+            exit 1
+          fi
+          echo "Confirmation validee — destruction en cours..."
+          echo "Declenchee par : ${{ github.actor }}"
+          echo "Date           : $(date '+%d/%m/%Y %H:%M:%S')"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 2 — Arret des services sur la VM (avant destruction)
+# ════════════════════════════════════════════════════════════════════════════
+  job2_stop_services:
+    name: "JOB 2 — Arret des services"
+    runs-on: ubuntu-latest
+    needs: job1_confirm
+
+    steps:
+      - name: Configuration credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Detection de la VM active
+        id: detect_vm
+        run: |
+          RUNNING=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=gmao-server" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].[InstanceId,PublicIpAddress]" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$RUNNING" ]; then
+            INSTANCE_ID=$(echo "$RUNNING" | awk '{print $1}' | head -1)
+            PUBLIC_IP=$(echo "$RUNNING" | awk '{print $2}' | head -1)
+            echo "VM active detectee : $INSTANCE_ID ($PUBLIC_IP)"
+            echo "vm_found=true" >> $GITHUB_OUTPUT
+            echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+            echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+          else
+            echo "Aucune VM active detectee"
+            echo "vm_found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configuration cle SSH
+        if: steps.detect_vm.outputs.vm_found == 'true'
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
+          chmod 600 ~/.ssh/vockey.pem
+
+      - name: Arret des applications sur la VM
+        if: steps.detect_vm.outputs.vm_found == 'true'
+        continue-on-error: true
+        run: |
+          VM_IP="${{ steps.detect_vm.outputs.public_ip }}"
+          ssh -i ~/.ssh/vockey.pem \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=10 \
+              ubuntu@$VM_IP bash << 'SSHEOF'
+
+            echo "Arret du frontend Angular..."
+            pkill -f "ng serve" 2>/dev/null || true
+            pkill -f "node.*angular" 2>/dev/null || true
+
+            echo "Arret du backend Spring Boot..."
+            pkill -f "spring-boot" 2>/dev/null || true
+            pkill -f "java.*gmao" 2>/dev/null || true
+            pkill -f "java.*jar" 2>/dev/null || true
+
+            echo "Arret de CloudWatch Agent..."
+            sudo systemctl stop amazon-cloudwatch-agent 2>/dev/null || true
+
+            echo "Services arretes"
+          SSHEOF
+
+    outputs:
+      vm_found:    ${{ steps.detect_vm.outputs.vm_found }}
+      instance_id: ${{ steps.detect_vm.outputs.instance_id }}
+      public_ip:   ${{ steps.detect_vm.outputs.public_ip }}
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 3 — Terraform Destroy (destruction de la VM EC2)
+# ════════════════════════════════════════════════════════════════════════════
+  job3_terraform_destroy:
+    name: "JOB 3 — Terraform Destroy"
+    runs-on: ubuntu-latest
+    needs: job2_stop_services
+
+    steps:
+      - name: Checkout du depot
+        uses: actions/checkout@v4
+
+      - name: Configuration credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.0"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+
+      - name: Import de la VM dans le state (si necessaire)
+        if: needs.job2_stop_services.outputs.vm_found == 'true'
+        working-directory: ${{ env.TF_DIR }}
+        continue-on-error: true
+        run: |
+          INSTANCE_ID="${{ needs.job2_stop_services.outputs.instance_id }}"
+          echo "Verification du state Terraform..."
+          if ! terraform state list 2>/dev/null | grep -q "aws_instance"; then
+            echo "VM absente du state — tentative d import..."
+            terraform import aws_instance.gmao_server "$INSTANCE_ID" 2>/dev/null || \
+              echo "Import echoue — destruction directe via AWS CLI en fallback"
+          else
+            echo "VM deja dans le state Terraform"
+          fi
+
+      - name: Terraform Plan (destroy)
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan -destroy -out=tfplan-destroy 2>&1 || true
+
+      - name: Terraform Destroy
+        working-directory: ${{ env.TF_DIR }}
+        continue-on-error: true
+        run: |
+          terraform apply -auto-approve tfplan-destroy 2>&1 || {
+            echo "Terraform destroy a echoue — fallback AWS CLI"
+          }
+
+      - name: Fallback AWS CLI - Termination forcee des VMs restantes
+        run: |
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=gmao-server" \
+                      "Name=instance-state-name,Values=running,stopped,pending,stopping" \
+            --query "Reservations[].Instances[].InstanceId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$INSTANCE_IDS" ]; then
+            COUNT=$(echo "$INSTANCE_IDS" | wc -w)
+            echo "$COUNT VM(s) encore presentes — termination forcee..."
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS
+            echo "Attente de la termination..."
+            aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS
+            echo "$COUNT VM(s) terminees avec succes"
+          else
+            echo "Aucune VM gmao-server restante"
+          fi
+
+      - name: Nettoyage du state Terraform
+        working-directory: ${{ env.TF_DIR }}
+        continue-on-error: true
+        run: |
+          terraform state list 2>/dev/null | xargs -r terraform state rm 2>/dev/null || true
+          echo "State Terraform nettoye"
+
+      - name: Verification finale — aucune VM active
+        run: |
+          REMAINING=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=gmao-server" \
+                      "Name=instance-state-name,Values=running,pending" \
+            --query "Reservations[].Instances[].InstanceId" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$REMAINING" ]; then
+            echo "ATTENTION — VMs encore actives : $REMAINING"
+            exit 1
+          fi
+          echo "Aucune VM gmao-server active — destruction confirmee"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 4 — Nettoyage CloudWatch et SNS
+# ════════════════════════════════════════════════════════════════════════════
+  job4_cleanup_monitoring:
+    name: "JOB 4 — Nettoyage CloudWatch / SNS"
+    runs-on: ubuntu-latest
+    needs: job3_terraform_destroy
+
+    steps:
+      - name: Configuration credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Suppression des alarmes CloudWatch
+        if: ${{ github.event.inputs.cleanup_cloudwatch == 'true' }}
+        continue-on-error: true
+        run: |
+          ALARMS=$(aws cloudwatch describe-alarms \
+            --alarm-name-prefix "gmao-" \
+            --query 'MetricAlarms[].AlarmName' \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$ALARMS" ]; then
+            echo "Suppression des alarmes : $ALARMS"
+            aws cloudwatch delete-alarms --alarm-names $ALARMS
+            echo "Alarmes supprimees"
+          else
+            echo "Aucune alarme gmao- trouvee"
+          fi
+
+      - name: Suppression du dashboard CloudWatch
+        if: ${{ github.event.inputs.cleanup_cloudwatch == 'true' }}
+        continue-on-error: true
+        run: |
+          aws cloudwatch delete-dashboards \
+            --dashboard-names "GMAO-Dashboard" 2>/dev/null && \
+            echo "Dashboard GMAO-Dashboard supprime" || \
+            echo "Dashboard non trouve"
+
+      - name: Suppression des log groups CloudWatch
+        if: ${{ github.event.inputs.cleanup_cloudwatch == 'true' }}
+        continue-on-error: true
+        run: |
+          for LOG_GROUP in /gmao/backend /gmao/frontend /gmao/postgresql /gmao/system; do
+            aws logs delete-log-group \
+              --log-group-name "$LOG_GROUP" 2>/dev/null && \
+              echo "Log group $LOG_GROUP supprime" || \
+              echo "Log group $LOG_GROUP non trouve"
+          done
+
+      - name: Suppression du topic SNS
+        if: ${{ github.event.inputs.cleanup_sns == 'true' }}
+        continue-on-error: true
+        run: |
+          TOPIC_ARN=$(aws sns list-topics \
+            --query "Topics[?ends_with(TopicArn,'gmao-alerts')].TopicArn" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$TOPIC_ARN" ]; then
+            echo "Suppression du topic : $TOPIC_ARN"
+            aws sns delete-topic --topic-arn "$TOPIC_ARN"
+            echo "Topic SNS supprime"
+          else
+            echo "Aucun topic gmao-alerts trouve"
+          fi
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB FINAL — Rapport de destruction
+# ════════════════════════════════════════════════════════════════════════════
+  job_notify_destroy:
+    name: "JOB FINAL — Rapport de destruction"
+    runs-on: ubuntu-latest
+    needs: [job2_stop_services, job3_terraform_destroy, job4_cleanup_monitoring]
+    if: always()
+
+    env:
+      J2_STATUS: ${{ needs.job2_stop_services.result }}
+      J3_STATUS: ${{ needs.job3_terraform_destroy.result }}
+      J4_STATUS: ${{ needs.job4_cleanup_monitoring.result }}
+      OLD_IP:    ${{ needs.job2_stop_services.outputs.public_ip }}
+
+    steps:
+      - name: Rapport de destruction
+        run: |
+          echo "RAPPORT DE DESTRUCTION GMAO"
+          echo "Date          : $(date '+%d/%m/%Y %H:%M:%S')"
+          echo "Declenche par : ${{ github.actor }}"
+          echo "---"
+          echo "JOB 2 — Arret services       : $J2_STATUS"
+          echo "JOB 3 — Terraform Destroy     : $J3_STATUS"
+          echo "JOB 4 — Nettoyage CloudWatch  : $J4_STATUS"
+          echo "---"
+          if [ "$J3_STATUS" = "success" ]; then
+            echo "INFRASTRUCTURE DETRUITE AVEC SUCCES"
+          else
+            echo "DESTRUCTION INCOMPLETE — verifiez les logs"
+          fi
+          echo "Ancienne IP VM : ${OLD_IP:-inconnue}"
+          echo "CloudWatch     : ${{ github.event.inputs.cleanup_cloudwatch == 'true' && 'nettoye' || 'conserve' }}"
+          echo "SNS            : ${{ github.event.inputs.cleanup_sns == 'true' && 'supprime' || 'conserve' }}"
+          echo "Logs : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Envoi email destruction via Gmail SMTP
+        continue-on-error: true
+        run: |
+          if [ "$J3_STATUS" = "success" ]; then
+            SUJET="[GMAO] Infrastructure detruite — $(date '+%d/%m/%Y %H:%M')"
+          else
+            SUJET="[GMAO] Destruction incomplete — $(date '+%d/%m/%Y %H:%M')"
+          fi
+
+          BODY="RAPPORT DESTRUCTION GMAO | Date: $(date '+%d/%m/%Y %H:%M:%S') | Par: ${{ github.actor }} | Arret services: $J2_STATUS | Terraform Destroy: $J3_STATUS | Nettoyage monitoring: $J4_STATUS | Ancienne IP: ${OLD_IP:-inconnue} | Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          sudo apt-get install -y msmtp msmtp-mta -q
+
+          {
+            echo "defaults"
+            echo "auth on"
+            echo "tls on"
+            echo "tls_trust_file /etc/ssl/certs/ca-certificates.crt"
+            echo "logfile ~/.msmtp.log"
+            echo ""
+            echo "account gmail"
+            echo "host smtp.gmail.com"
+            echo "port 587"
+            echo "from ${{ secrets.GMAIL_USER }}"
+            echo "user ${{ secrets.GMAIL_USER }}"
+            echo "password ${{ secrets.GMAIL_PASSWORD }}"
+            echo ""
+            echo "account default : gmail"
+          } > ~/.msmtprc
+          chmod 600 ~/.msmtprc
+
+          printf "To: oumaimabn.amelmm@gmail.com\nFrom: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s" \
+            "${{ secrets.GMAIL_USER }}" "$SUJET" "$BODY" | \
+            msmtp "oumaimabn.amelmm@gmail.com" && \
+            echo "Email destruction envoye" || \
+            echo "Echec envoi email"
