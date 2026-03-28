@@ -22,7 +22,7 @@ on:
           - "false"
           - "true"
       destroy_infra:
-        description: "🔴 Détruire l'infrastructure (terraform destroy)"
+        description: "Détruire l'infrastructure (terraform destroy)"
         required: false
         default: "false"
         type: choice
@@ -41,7 +41,7 @@ concurrency:
 jobs:
 
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB 0 — Validation du code (compile + tests) AVANT tout déploiement
+#  JOB 0 — Validation du code
 # ════════════════════════════════════════════════════════════════════════════
   job0_validate_code:
     name: "JOB 0 — Validation du code"
@@ -53,67 +53,58 @@ jobs:
       frontend_ok: ${{ steps.validate_frontend.outputs.frontend_ok }}
 
     steps:
-      - name: 📥 Checkout du dépôt
+      - name: Checkout du depot
         uses: actions/checkout@v4
 
-      - name: ☕ Setup Java 11
+      - name: Setup Java 11
         uses: actions/setup-java@v4
         with:
           java-version: '11'
           distribution: 'temurin'
 
-      - name: 🟢 Setup Node.js 18
+      - name: Setup Node.js 18
         uses: actions/setup-node@v4
         with:
           node-version: '18'
 
-      - name: 🔍 Vérification VM déjà active (skip si VM existe)
-        id: check_existing_vm
-        run: |
-          echo "skip_validation=${{ github.event.inputs.skip_post_install == 'true' && 'true' || 'false' }}" >> $GITHUB_OUTPUT
-
-      - name: 🏗️ Validation backend (mvn compile)
+      - name: Validation backend (mvn compile)
         id: validate_backend
         run: |
           if [ -f "gmao-backend/pom.xml" ]; then
-            echo "📦 Compilation du backend Maven..."
+            echo "Compilation du backend Maven..."
             cd gmao-backend
             mvn compile -q --no-transfer-progress 2>&1
             echo "backend_ok=true" >> $GITHUB_OUTPUT
-            echo "✅ Backend compilé avec succès"
+            echo "Backend compile avec succes"
           else
-            echo "⚠️ Pas de pom.xml trouvé — validation backend ignorée"
+            echo "Pas de pom.xml trouve — validation backend ignoree"
             echo "backend_ok=skipped" >> $GITHUB_OUTPUT
           fi
 
-      - name: 🌐 Validation frontend (npm install + build check)
+      - name: Validation frontend (npm install)
         id: validate_frontend
         run: |
           if [ -f "gmao-frontend/package.json" ]; then
-            echo "📦 Vérification du frontend..."
+            echo "Verification du frontend..."
             cd gmao-frontend
             npm install --silent 2>&1
             echo "frontend_ok=true" >> $GITHUB_OUTPUT
-            echo "✅ Frontend validé avec succès"
+            echo "Frontend valide avec succes"
           else
-            echo "⚠️ Pas de package.json trouvé — validation frontend ignorée"
+            echo "Pas de package.json trouve — validation frontend ignoree"
             echo "frontend_ok=skipped" >> $GITHUB_OUTPUT
           fi
 
-      - name: 📋 Résumé validation
+      - name: Resume validation
         run: |
-          echo "════════════════════════════════"
-          echo "  RÉSULTAT VALIDATION CODE"
-          echo "════════════════════════════════"
-          echo "  Backend  : ${{ steps.validate_backend.outputs.backend_ok }}"
-          echo "  Frontend : ${{ steps.validate_frontend.outputs.frontend_ok }}"
-          echo "════════════════════════════════"
+          echo "Backend  : ${{ steps.validate_backend.outputs.backend_ok }}"
+          echo "Frontend : ${{ steps.validate_frontend.outputs.frontend_ok }}"
 
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB 1 — Vérification VM existante OU création nouvelle VM
+#  JOB 1 — Creation VM EC2
 # ════════════════════════════════════════════════════════════════════════════
   job1_create_vm:
-    name: "JOB 1 — Création / Vérification VM EC2"
+    name: "JOB 1 — Creation / Verification VM EC2"
     runs-on: ubuntu-latest
     needs: job0_validate_code
     if: ${{ github.event.inputs.destroy_infra != 'true' }}
@@ -125,10 +116,10 @@ jobs:
       vm_skipped:  ${{ steps.resolve_ip.outputs.vm_skipped }}
 
     steps:
-      - name: 📥 Checkout du dépôt
+      - name: Checkout du depot
         uses: actions/checkout@v4
 
-      - name: 🔑 Configuration credentials AWS
+      - name: Configuration credentials AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -136,17 +127,17 @@ jobs:
           aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      - name: 🏗️ Setup Terraform
+      - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.6.0"
           terraform_wrapper: false
 
-      - name: 🔧 Terraform Init
+      - name: Terraform Init
         working-directory: ${{ env.TF_DIR }}
         run: terraform init
 
-      - name: 🔍 Détection VM déjà en cours d'exécution
+      - name: Detection VM deja en cours d execution
         id: detect_running_vm
         run: |
           RUNNING=$(aws ec2 describe-instances \
@@ -158,23 +149,22 @@ jobs:
           if [ -n "$RUNNING" ]; then
             INSTANCE_ID=$(echo "$RUNNING" | awk '{print $1}' | head -1)
             PUBLIC_IP=$(echo "$RUNNING"   | awk '{print $2}' | head -1)
-            echo "♻️ VM déjà active détectée : $INSTANCE_ID ($PUBLIC_IP)"
+            echo "VM deja active : $INSTANCE_ID ($PUBLIC_IP)"
             echo "vm_already_running=true"  >> $GITHUB_OUTPUT
             echo "existing_ip=$PUBLIC_IP"   >> $GITHUB_OUTPUT
             echo "existing_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
           else
-            echo "🆕 Aucune VM active — création nécessaire"
+            echo "Aucune VM active — creation necessaire"
             echo "vm_already_running=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: "✅ VM déjà active - skip création"
+      - name: VM deja active — skip creation
         if: steps.detect_running_vm.outputs.vm_already_running == 'true'
         run: |
-          echo "♻️ VM existante réutilisée : ${{ steps.detect_running_vm.outputs.existing_id }}"
-          echo "   IP : ${{ steps.detect_running_vm.outputs.existing_ip }}"
-          echo "   → Jobs 2 et 3 seront également skippés"
+          echo "VM existante reutilisee : ${{ steps.detect_running_vm.outputs.existing_id }}"
+          echo "IP : ${{ steps.detect_running_vm.outputs.existing_ip }}"
 
-      - name: 🔴 Destroy VMs précédentes arrêtées (si elles existent)
+      - name: Destroy VMs precedentes arretees
         if: steps.detect_running_vm.outputs.vm_already_running != 'true'
         working-directory: ${{ env.TF_DIR }}
         run: |
@@ -186,32 +176,31 @@ jobs:
 
           if [ -n "$INSTANCE_IDS" ]; then
             COUNT=$(echo "$INSTANCE_IDS" | wc -w)
-            echo "🔴 $COUNT VM(s) arrêtée(s) détectée(s) : $INSTANCE_IDS"
+            echo "$COUNT VM(s) arretee(s) : $INSTANCE_IDS"
             aws ec2 terminate-instances --instance-ids $INSTANCE_IDS
             aws ec2 wait instance-terminated --instance-ids $INSTANCE_IDS
-            echo "✅ $COUNT VM(s) supprimée(s)"
+            echo "$COUNT VM(s) supprimee(s)"
             terraform state list 2>/dev/null | xargs -r terraform state rm 2>/dev/null || true
-            echo "✅ State Terraform nettoyé"
           else
-            echo "ℹ️ Aucune VM arrêtée à nettoyer"
+            echo "Aucune VM arretee a nettoyer"
           fi
 
-      - name: ✅ Terraform Validate
+      - name: Terraform Validate
         if: steps.detect_running_vm.outputs.vm_already_running != 'true'
         working-directory: ${{ env.TF_DIR }}
         run: terraform validate
 
-      - name: 📋 Terraform Plan
+      - name: Terraform Plan
         if: steps.detect_running_vm.outputs.vm_already_running != 'true'
         working-directory: ${{ env.TF_DIR }}
         run: terraform plan -out=tfplan
 
-      - name: 🚀 Terraform Apply
+      - name: Terraform Apply
         if: steps.detect_running_vm.outputs.vm_already_running != 'true'
         working-directory: ${{ env.TF_DIR }}
         run: terraform apply -auto-approve tfplan
 
-      - name: 📤 Résolution IP finale
+      - name: Resolution IP finale
         id: resolve_ip
         working-directory: ${{ env.TF_DIR }}
         run: |
@@ -228,26 +217,26 @@ jobs:
           fi
           echo "public_ip=$PUBLIC_IP"     >> $GITHUB_OUTPUT
           echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
-          echo "→ ID: $INSTANCE_ID | IP: $PUBLIC_IP"
+          echo "ID: $INSTANCE_ID | IP: $PUBLIC_IP"
 
-      - name: ⏳ Attente SSH disponible (2 min max)
+      - name: Attente SSH disponible (2 min max)
         if: steps.detect_running_vm.outputs.vm_already_running != 'true'
         run: |
           VM_IP="${{ steps.resolve_ip.outputs.public_ip }}"
           echo "Attente du port 22 sur $VM_IP..."
           for i in $(seq 1 24); do
             if nc -zv "$VM_IP" 22 2>/dev/null; then
-              echo "✅ SSH disponible !"
+              echo "SSH disponible"
               exit 0
             fi
-            echo "  Tentative $i/24 — 5s..."
+            echo "Tentative $i/24 — 5s..."
             sleep 5
           done
-          echo "❌ SSH non disponible après 2 minutes"
+          echo "SSH non disponible apres 2 minutes"
           exit 1
 
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB 2 — Post-installation (skippé si VM déjà active)
+#  JOB 2 — Post-installation
 # ════════════════════════════════════════════════════════════════════════════
   job2_post_install:
     name: "JOB 2 — Post-Installation"
@@ -261,31 +250,31 @@ jobs:
       VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
 
     steps:
-      - name: 📥 Checkout du dépôt
+      - name: Checkout du depot
         uses: actions/checkout@v4
 
-      - name: 🔑 Configuration clé SSH (vockey)
+      - name: Configuration cle SSH (vockey)
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
           chmod 600 ~/.ssh/vockey.pem
           ssh-keygen -l -f ~/.ssh/vockey.pem || {
-            echo "❌ Clé SSH invalide — vérifiez le secret SSH_PRIVATE_KEY"
+            echo "Cle SSH invalide"
             exit 1
           }
-          cat >> ~/.ssh/config << 'SSHCFG'
-Host *
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null
-  IdentityFile ~/.ssh/vockey.pem
-SSHCFG
+          cat >> ~/.ssh/config << SSHCFG
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            IdentityFile ~/.ssh/vockey.pem
+          SSHCFG
 
-      - name: 🔍 Vérification installations existantes
+      - name: Verification installations existantes
         id: check_install
         run: |
           SKIP_INPUT="${{ github.event.inputs.skip_post_install || 'false' }}"
           if [ "$SKIP_INPUT" = "true" ]; then
-            echo "⏭️ Skip post-install demandé manuellement"
+            echo "Skip post-install demande manuellement"
             echo "already_installed=true" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -299,14 +288,14 @@ SSHCFG
               2>/dev/null || echo "")
 
           if echo "$INSTALLED" | grep -q "ALL_OK"; then
-            echo "✅ Tous les outils et projets sont déjà installés"
+            echo "Tous les outils et projets sont deja installes"
             echo "already_installed=true" >> $GITHUB_OUTPUT
           else
-            echo "📦 Installation nécessaire"
+            echo "Installation necessaire"
             echo "already_installed=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: 📤 Copie du script post-install sur la VM
+      - name: Copie du script post-install sur la VM
         if: steps.check_install.outputs.already_installed != 'true'
         run: |
           scp -i ~/.ssh/vockey.pem \
@@ -314,7 +303,7 @@ SSHCFG
               scripts/02_post_install.sh \
               ubuntu@${{ env.VM_IP }}:~/02_post_install.sh
 
-      - name: ⚙️ Exécution du post-install (Java, Maven, PostgreSQL, Node, npm, projets)
+      - name: Execution du post-install
         if: steps.check_install.outputs.already_installed != 'true'
         timeout-minutes: 15
         run: |
@@ -323,25 +312,23 @@ SSHCFG
               ubuntu@${{ env.VM_IP }} \
               "chmod +x ~/02_post_install.sh && ~/02_post_install.sh"
 
-      - name: ✅ Vérification des installations
+      - name: Verification des installations
         run: |
           ssh -i ~/.ssh/vockey.pem \
               -o StrictHostKeyChecking=no \
               ubuntu@${{ env.VM_IP }} \
-              "echo '=== Outils ===' && \
-               java -version 2>&1 | head -1 && \
+              "java -version 2>&1 | head -1 && \
                mvn -version 2>&1 | head -1 && \
                psql --version && \
                node -v && npm -v && \
-               echo '=== Projets ===' && \
-               ls ~/gmao-backend/ && echo '✅ gmao-backend OK' && \
-               ls ~/gmao-frontend/ && echo '✅ gmao-frontend OK'"
+               ls ~/gmao-backend/ && echo 'gmao-backend OK' && \
+               ls ~/gmao-frontend/ && echo 'gmao-frontend OK'"
 
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB 3 — Démarrage Application (skippé si VM déjà active)
+#  JOB 3 — Demarrage Application
 # ════════════════════════════════════════════════════════════════════════════
   job3_start_app:
-    name: "JOB 3 — Démarrage Application GMAO"
+    name: "JOB 3 — Demarrage Application GMAO"
     runs-on: ubuntu-latest
     needs: [job1_create_vm, job2_post_install]
     if: |
@@ -352,26 +339,26 @@ SSHCFG
       VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
 
     steps:
-      - name: 📥 Checkout du dépôt
+      - name: Checkout du depot
         uses: actions/checkout@v4
 
-      - name: 🔑 Configuration clé SSH (vockey)
+      - name: Configuration cle SSH (vockey)
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
           chmod 600 ~/.ssh/vockey.pem
           ssh-keygen -l -f ~/.ssh/vockey.pem || {
-            echo "❌ Clé SSH invalide — vérifiez le secret SSH_PRIVATE_KEY"
+            echo "Cle SSH invalide"
             exit 1
           }
-          cat >> ~/.ssh/config << 'SSHCFG'
-Host *
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null
-  IdentityFile ~/.ssh/vockey.pem
-SSHCFG
+          cat >> ~/.ssh/config << SSHCFG
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            IdentityFile ~/.ssh/vockey.pem
+          SSHCFG
 
-      - name: 📤 Copie du dossier BD/ (restore.sh + backup SQL)
+      - name: Copie du dossier BD
         run: |
           ssh -i ~/.ssh/vockey.pem \
               -o StrictHostKeyChecking=no \
@@ -381,14 +368,14 @@ SSHCFG
               -r BD/* \
               ubuntu@${{ env.VM_IP }}:~/BD/
 
-      - name: 📤 Copie du script de démarrage
+      - name: Copie du script de demarrage
         run: |
           scp -i ~/.ssh/vockey.pem \
               -o StrictHostKeyChecking=no \
               scripts/03_start_app.sh \
               ubuntu@${{ env.VM_IP }}:~/03_start_app.sh
 
-      - name: 🚀 Lancement (restore DB + Spring Boot + Angular)
+      - name: Lancement (restore DB + Spring Boot + Angular)
         timeout-minutes: 10
         run: |
           ssh -i ~/.ssh/vockey.pem \
@@ -396,41 +383,40 @@ SSHCFG
               ubuntu@${{ env.VM_IP }} \
               "chmod +x ~/03_start_app.sh && ~/03_start_app.sh"
 
-      - name: 🔍 Test de connectivité Backend (port 8080)
+      - name: Test connectivite Backend (port 8080)
         run: |
           echo "Test http://${{ env.VM_IP }}:8080 ..."
           for i in $(seq 1 12); do
             HTTP_CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
               http://${{ env.VM_IP }}:8080 2>/dev/null || echo "000")
             if [ "$HTTP_CODE" != "000" ]; then
-              echo "✅ Backend répond sur le port 8080 (HTTP $HTTP_CODE)"
+              echo "Backend repond sur le port 8080 (HTTP $HTTP_CODE)"
               exit 0
             fi
-            echo "  Tentative $i/12 — 5s..."
+            echo "Tentative $i/12 — 5s..."
             sleep 5
           done
-          echo "❌ Backend non accessible après 60s"
+          echo "Backend non accessible apres 60s"
           exit 1
 
-      - name: 🔍 Test de connectivité Frontend Angular (port 4200)
+      - name: Test connectivite Frontend Angular (port 4200)
         run: |
           echo "Test http://${{ env.VM_IP }}:4200 ..."
           for i in $(seq 1 12); do
             HTTP_CODE=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
               http://${{ env.VM_IP }}:4200 2>/dev/null || echo "000")
             if [ "$HTTP_CODE" != "000" ]; then
-              echo "✅ Frontend Angular répond sur le port 4200 (HTTP $HTTP_CODE)"
+              echo "Frontend repond sur le port 4200 (HTTP $HTTP_CODE)"
               exit 0
             fi
-            echo "  Tentative $i/12 — 5s..."
+            echo "Tentative $i/12 — 5s..."
             sleep 5
           done
-          echo "❌ Frontend Angular non accessible après 60s"
+          echo "Frontend non accessible apres 60s"
           exit 1
 
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB MONITORING — CloudWatch (santé, métriques, logs)
-#  → Exécuté après Job 3, skippé si VM déjà active
+#  JOB 4 — Monitoring CloudWatch
 # ════════════════════════════════════════════════════════════════════════════
   job4_monitoring:
     name: "JOB 4 — Monitoring CloudWatch"
@@ -447,10 +433,10 @@ SSHCFG
       INSTANCE_ID: ${{ needs.job1_create_vm.outputs.instance_id }}
 
     steps:
-      - name: 📥 Checkout du dépôt
+      - name: Checkout du depot
         uses: actions/checkout@v4
 
-      - name: 🔑 Configuration credentials AWS
+      - name: Configuration credentials AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -458,34 +444,30 @@ SSHCFG
           aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region:            ${{ env.AWS_REGION }}
 
-      - name: 🔑 Configuration clé SSH (vockey)
+      - name: Configuration cle SSH
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
           chmod 600 ~/.ssh/vockey.pem
-          cat >> ~/.ssh/config << 'SSHCFG'
-Host *
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null
-  IdentityFile ~/.ssh/vockey.pem
-SSHCFG
+          cat >> ~/.ssh/config << SSHCFG
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            IdentityFile ~/.ssh/vockey.pem
+          SSHCFG
 
-      # ── Installation CloudWatch Agent sur la VM ──────────────────────────
-      - name: 📦 Installation du CloudWatch Agent sur la VM
+      - name: Installation CloudWatch Agent sur la VM
         run: |
-          ssh -i ~/.ssh/vockey.pem ubuntu@${{ env.VM_IP }} << 'SSHEOF'
-            echo "=== Installation CloudWatch Agent ==="
-            # Téléchargement de l'agent
+          ssh -i ~/.ssh/vockey.pem ubuntu@${{ env.VM_IP }} bash << 'SSHEOF'
+            echo "Installation CloudWatch Agent..."
             wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
             sudo dpkg -i amazon-cloudwatch-agent.deb
             rm -f amazon-cloudwatch-agent.deb
-            echo "✅ CloudWatch Agent installé"
+            echo "CloudWatch Agent installe"
           SSHEOF
 
-      # ── Création et copie de la config CloudWatch ────────────────────────
-      - name: 📝 Configuration CloudWatch (métriques + logs)
+      - name: Configuration CloudWatch (metriques + logs)
         run: |
-          # Créer le fichier de config localement
           cat > /tmp/cloudwatch-config.json << 'CONFIG'
           {
             "agent": {
@@ -519,7 +501,7 @@ SSHCFG
                 "files": {
                   "collect_list": [
                     {
-                      "file_path": "/home/ubuntu/gmao-backend/logs/app.log",
+                      "file_path": "/home/ubuntu/backend.log",
                       "log_group_name": "/gmao/backend",
                       "log_stream_name": "{instance_id}",
                       "timezone": "UTC"
@@ -527,12 +509,6 @@ SSHCFG
                     {
                       "file_path": "/home/ubuntu/frontend.log",
                       "log_group_name": "/gmao/frontend",
-                      "log_stream_name": "{instance_id}",
-                      "timezone": "UTC"
-                    },
-                    {
-                      "file_path": "/var/log/postgresql/postgresql-*-main.log",
-                      "log_group_name": "/gmao/postgresql",
                       "log_stream_name": "{instance_id}",
                       "timezone": "UTC"
                     },
@@ -549,119 +525,93 @@ SSHCFG
           }
           CONFIG
 
-          # Copier la config sur la VM
           scp -i ~/.ssh/vockey.pem \
               /tmp/cloudwatch-config.json \
               ubuntu@${{ env.VM_IP }}:/tmp/cloudwatch-config.json
 
-          # Démarrer l'agent avec la config
-          ssh -i ~/.ssh/vockey.pem ubuntu@${{ env.VM_IP }} << 'SSHEOF'
-            # Créer le répertoire de logs backend s'il n'existe pas
-            mkdir -p /home/ubuntu/gmao-backend/logs
-            touch /home/ubuntu/gmao-backend/logs/app.log
-
-            # Permettre à l'agent CloudWatch de lire les logs PostgreSQL
-            sudo chmod -R o+r /var/log/postgresql/ 2>/dev/null || true
-
+          ssh -i ~/.ssh/vockey.pem ubuntu@${{ env.VM_IP }} bash << 'SSHEOF'
             sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
-            sudo cp /tmp/cloudwatch-config.json /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+            sudo cp /tmp/cloudwatch-config.json \
+              /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
             sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-              -a fetch-config \
-              -m ec2 \
+              -a fetch-config -m ec2 \
               -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
               -s
-            echo "✅ CloudWatch Agent démarré"
             sudo systemctl enable amazon-cloudwatch-agent
-            sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status
+            echo "CloudWatch Agent demarre"
           SSHEOF
 
-      # ── Création topic SNS + abonnements emails ──────────────────────────
-      - name: 📧 Création topic SNS pour les alertes email
+      - name: Creation topic SNS pour les alertes
         run: |
-          # Créer le topic SNS
           TOPIC_ARN=$(aws sns create-topic \
             --name gmao-alerts \
             --query 'TopicArn' \
             --output text)
-          echo "✅ Topic SNS créé : $TOPIC_ARN"
+          echo "Topic SNS : $TOPIC_ARN"
           echo "TOPIC_ARN=$TOPIC_ARN" >> $GITHUB_ENV
 
-          # Abonner les deux emails
           aws sns subscribe \
             --topic-arn "$TOPIC_ARN" \
             --protocol email \
             --notification-endpoint "oumaimabn.amelmm@gmail.com"
+          echo "Abonnement email cree"
 
-          echo "✅ Abonnements email créés (confirmation requise par email)"
-
-      # ── Création des alarmes CloudWatch ─────────────────────────────────
-      - name: 🚨 Création des alarmes CloudWatch
+      - name: Creation des alarmes CloudWatch
         run: |
           INSTANCE_ID="${{ env.INSTANCE_ID }}"
           TOPIC_ARN="${{ env.TOPIC_ARN }}"
 
-          # Alarme CPU > 80% pendant 5 minutes
           aws cloudwatch put-metric-alarm \
             --alarm-name "gmao-cpu-high" \
-            --alarm-description "CPU EC2 GMAO > 80%" \
+            --alarm-description "CPU GMAO > 80%" \
             --metric-name CPUUtilization \
             --namespace AWS/EC2 \
             --statistic Average \
             --dimensions Name=InstanceId,Value=$INSTANCE_ID \
-            --period 300 \
-            --evaluation-periods 1 \
+            --period 300 --evaluation-periods 1 \
             --threshold 80 \
             --comparison-operator GreaterThanThreshold \
             --alarm-actions "$TOPIC_ARN" \
             --ok-actions "$TOPIC_ARN"
-          echo "✅ Alarme CPU créée"
 
-          # Alarme mémoire > 85%
           aws cloudwatch put-metric-alarm \
             --alarm-name "gmao-memory-high" \
-            --alarm-description "Mémoire EC2 GMAO > 85%" \
+            --alarm-description "Memoire GMAO > 85%" \
             --metric-name mem_used_percent \
             --namespace GMAO/EC2 \
             --statistic Average \
             --dimensions Name=InstanceId,Value=$INSTANCE_ID \
-            --period 300 \
-            --evaluation-periods 1 \
+            --period 300 --evaluation-periods 1 \
             --threshold 85 \
             --comparison-operator GreaterThanThreshold \
             --alarm-actions "$TOPIC_ARN" \
             --ok-actions "$TOPIC_ARN"
-          echo "✅ Alarme mémoire créée"
 
-          # Alarme disque > 90%
           aws cloudwatch put-metric-alarm \
             --alarm-name "gmao-disk-full" \
-            --alarm-description "Disque EC2 GMAO > 90%" \
+            --alarm-description "Disque GMAO > 90%" \
             --metric-name disk_used_percent \
             --namespace GMAO/EC2 \
             --statistic Average \
             --dimensions Name=InstanceId,Value=$INSTANCE_ID \
-            --period 300 \
-            --evaluation-periods 1 \
+            --period 300 --evaluation-periods 1 \
             --threshold 90 \
             --comparison-operator GreaterThanThreshold \
             --alarm-actions "$TOPIC_ARN" \
             --ok-actions "$TOPIC_ARN"
-          echo "✅ Alarme disque créée"
 
-          echo ""
-          echo "=== Alarmes CloudWatch configurées ==="
+          echo "Alarmes CloudWatch creees"
           aws cloudwatch describe-alarms \
             --alarm-name-prefix "gmao-" \
             --query 'MetricAlarms[].{Nom:AlarmName,Etat:StateValue}' \
             --output table
 
-      # ── Création du dashboard CloudWatch ────────────────────────────────
-      - name: 📊 Création du dashboard CloudWatch GMAO
+      - name: Creation dashboard CloudWatch
         run: |
           INSTANCE_ID="${{ env.INSTANCE_ID }}"
           REGION="${{ env.AWS_REGION }}"
 
-          DASHBOARD=$(cat << DASH
+          cat > /tmp/dashboard.json << DASH
           {
             "widgets": [
               {
@@ -678,7 +628,7 @@ SSHCFG
                 "type": "metric",
                 "x": 12, "y": 0, "width": 12, "height": 6,
                 "properties": {
-                  "title": "Mémoire utilisée (%)",
+                  "title": "Memoire utilisee (%)",
                   "metrics": [["GMAO/EC2","mem_used_percent","InstanceId","$INSTANCE_ID"]],
                   "period": 60, "stat": "Average", "region": "$REGION",
                   "view": "timeSeries"
@@ -688,7 +638,7 @@ SSHCFG
                 "type": "metric",
                 "x": 0, "y": 6, "width": 12, "height": 6,
                 "properties": {
-                  "title": "Disque utilisé (%)",
+                  "title": "Disque utilise (%)",
                   "metrics": [["GMAO/EC2","disk_used_percent","InstanceId","$INSTANCE_ID"]],
                   "period": 300, "stat": "Average", "region": "$REGION",
                   "view": "timeSeries"
@@ -698,7 +648,7 @@ SSHCFG
                 "type": "metric",
                 "x": 12, "y": 6, "width": 12, "height": 6,
                 "properties": {
-                  "title": "Trafic réseau (bytes)",
+                  "title": "Trafic reseau (bytes)",
                   "metrics": [
                     ["AWS/EC2","NetworkIn","InstanceId","$INSTANCE_ID"],
                     ["AWS/EC2","NetworkOut","InstanceId","$INSTANCE_ID"]
@@ -711,18 +661,8 @@ SSHCFG
                 "type": "log",
                 "x": 0, "y": 12, "width": 24, "height": 6,
                 "properties": {
-                  "title": "Logs Backend Spring Boot (~/gmao-backend/logs/app.log)",
+                  "title": "Logs Backend Spring Boot",
                   "query": "SOURCE '/gmao/backend' | fields @timestamp, @message | sort @timestamp desc | limit 20",
-                  "region": "$REGION",
-                  "view": "table"
-                }
-              },
-              {
-                "type": "log",
-                "x": 0, "y": 18, "width": 24, "height": 6,
-                "properties": {
-                  "title": "Logs PostgreSQL (/var/log/postgresql/)",
-                  "query": "SOURCE '/gmao/postgresql' | fields @timestamp, @message | sort @timestamp desc | limit 20",
                   "region": "$REGION",
                   "view": "table"
                 }
@@ -730,102 +670,97 @@ SSHCFG
             ]
           }
           DASH
-          )
 
           aws cloudwatch put-dashboard \
             --dashboard-name "GMAO-Dashboard" \
-            --dashboard-body "$DASHBOARD"
-          echo "✅ Dashboard CloudWatch créé"
+            --dashboard-body file:///tmp/dashboard.json
+          echo "Dashboard CloudWatch cree"
 
-      # ── Résumé monitoring ────────────────────────────────────────────────
-      - name: 📋 Résumé du monitoring
-        run: |
-          echo ""
-          echo "╔══════════════════════════════════════════════════════════════════╗"
-          echo "║              MONITORING CLOUDWATCH CONFIGURÉ ✅                  ║"
-          echo "╠══════════════════════════════════════════════════════════════════╣"
-          echo "║  Métriques collectées (toutes les 60s)"
-          echo "║  ├── CPU utilization"
-          echo "║  ├── Mémoire utilisée (%)"
-          echo "║  └── Espace disque (%)"
-          echo "║"
-          echo "║  Logs collectés"
-          echo "║  ├── /gmao/backend    ← ~/gmao-backend/logs/app.log"
-          echo "║  ├── /gmao/frontend   ← ~/frontend.log"
-          echo "║  ├── /gmao/postgresql ← /var/log/postgresql/*.log"
-          echo "║  └── /gmao/system     ← /var/log/syslog"
-          echo "║"
-          echo "║  Alarmes actives"
-          echo "║  ├── gmao-cpu-high    (seuil : 80%)"
-          echo "║  ├── gmao-memory-high (seuil : 85%)"
-          echo "║  └── gmao-disk-full   (seuil : 90%)"
-          echo "║"
-          echo "║  Alertes email → oumaimabn.amelmm@gmail.com"
-          echo "╠══════════════════════════════════════════════════════════════════╣"
-          echo "║  Dashboard → https://console.aws.amazon.com/cloudwatch/home"
-          echo "║              #dashboards:name=GMAO-Dashboard"
-          echo "╚══════════════════════════════════════════════════════════════════╝"
-          echo ""
-          echo "⚠️  Vérifie tes emails et confirme l'abonnement SNS pour recevoir les alertes."
-
-      # ── Rapport périodique : métriques actuelles envoyées par email ──────
-      - name: "📊 Rapport périodique - métriques actuelles via SNS"
+      - name: Rapport periodique metriques via SNS
         run: |
           INSTANCE_ID="${{ env.INSTANCE_ID }}"
           REGION="${{ env.AWS_REGION }}"
-          TOPIC_ARN=$(aws sns list-topics --query "Topics[?ends_with(TopicArn,'gmao-alerts')].TopicArn" --output text)
+          TOPIC_ARN=$(aws sns list-topics \
+            --query "Topics[?ends_with(TopicArn,'gmao-alerts')].TopicArn" \
+            --output text)
 
-          # Récupérer les métriques actuelles depuis CloudWatch
-          CPU=$(aws cloudwatch get-metric-statistics             --namespace AWS/EC2             --metric-name CPUUtilization             --dimensions Name=InstanceId,Value=$INSTANCE_ID             --start-time $(date -u -d '5 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')             --end-time $(date -u '+%Y-%m-%dT%H:%M:%SZ')             --period 300 --statistics Average             --query 'Datapoints[0].Average' --output text 2>/dev/null || echo "N/A")
+          START=$(date -u -d '5 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')
+          END=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-          MEM=$(aws cloudwatch get-metric-statistics             --namespace GMAO/EC2             --metric-name mem_used_percent             --dimensions Name=InstanceId,Value=$INSTANCE_ID             --start-time $(date -u -d '5 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')             --end-time $(date -u '+%Y-%m-%dT%H:%M:%SZ')             --period 300 --statistics Average             --query 'Datapoints[0].Average' --output text 2>/dev/null || echo "N/A")
+          CPU=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/EC2 --metric-name CPUUtilization \
+            --dimensions Name=InstanceId,Value=$INSTANCE_ID \
+            --start-time $START --end-time $END \
+            --period 300 --statistics Average \
+            --query 'Datapoints[0].Average' --output text 2>/dev/null || echo "N/A")
 
-          DISK=$(aws cloudwatch get-metric-statistics             --namespace GMAO/EC2             --metric-name disk_used_percent             --dimensions Name=InstanceId,Value=$INSTANCE_ID             --start-time $(date -u -d '5 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')             --end-time $(date -u '+%Y-%m-%dT%H:%M:%SZ')             --period 300 --statistics Average             --query 'Datapoints[0].Average' --output text 2>/dev/null || echo "N/A")
+          MEM=$(aws cloudwatch get-metric-statistics \
+            --namespace GMAO/EC2 --metric-name mem_used_percent \
+            --dimensions Name=InstanceId,Value=$INSTANCE_ID \
+            --start-time $START --end-time $END \
+            --period 300 --statistics Average \
+            --query 'Datapoints[0].Average' --output text 2>/dev/null || echo "N/A")
 
-          # Statut des services
-          BACKEND_STATUS=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}"             http://${{ env.VM_IP }}:8080 2>/dev/null || echo "DOWN")
-          FRONTEND_STATUS=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}"             http://${{ env.VM_IP }}:4200 2>/dev/null || echo "DOWN")
+          DISK=$(aws cloudwatch get-metric-statistics \
+            --namespace GMAO/EC2 --metric-name disk_used_percent \
+            --dimensions Name=InstanceId,Value=$INSTANCE_ID \
+            --start-time $START --end-time $END \
+            --period 300 --statistics Average \
+            --query 'Datapoints[0].Average' --output text 2>/dev/null || echo "N/A")
 
-          # Construire le message du rapport
-          MESSAGE="=== RAPPORT MONITORING GMAO ===
+          BACKEND_STATUS=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
+            http://${{ env.VM_IP }}:8080 2>/dev/null || echo "DOWN")
+          FRONTEND_STATUS=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
+            http://${{ env.VM_IP }}:4200 2>/dev/null || echo "DOWN")
+
+          MESSAGE="RAPPORT MONITORING GMAO
 Date       : $(date '+%d/%m/%Y %H:%M:%S')
 Instance   : $INSTANCE_ID
-Region     : $REGION
 
---- METRIQUES SYSTEME ---
-CPU utilisation  : ${CPU}%
-Memoire utilisee : ${MEM}%
-Disque utilise   : ${DISK}%
+METRIQUES SYSTEME
+CPU          : ${CPU}%
+Memoire      : ${MEM}%
+Disque       : ${DISK}%
 
---- ETAT DES SERVICES ---
-Backend  (port 8080) : HTTP $BACKEND_STATUS
-Frontend (port 4200) : HTTP $FRONTEND_STATUS
+ETAT DES SERVICES
+Backend  8080 : HTTP $BACKEND_STATUS
+Frontend 4200 : HTTP $FRONTEND_STATUS
 
---- SEUILS D'ALARME ---
-CPU     > 80%  → ALARME
-Memoire > 85%  → ALARME
-Disque  > 90%  → ALARME
+SEUILS ALARME
+CPU     > 80%
+Memoire > 85%
+Disque  > 90%
 
---- ACCES ---
-Backend  : http://${{ env.VM_IP }}:8080
-Frontend : http://${{ env.VM_IP }}:4200
-Dashboard: https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard
+ACCES
+Backend   : http://${{ env.VM_IP }}:8080
+Frontend  : http://${{ env.VM_IP }}:4200
+Dashboard : https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard
+Logs      : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-Logs complets : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-          # Envoyer le rapport via SNS
           if [ -n "$TOPIC_ARN" ]; then
-            aws sns publish               --topic-arn "$TOPIC_ARN"               --subject "📊 [GMAO] Rapport Monitoring — $(date '+%d/%m/%Y %H:%M')"               --message "$MESSAGE"
-            echo "✅ Rapport périodique envoyé via SNS"
+            aws sns publish \
+              --topic-arn "$TOPIC_ARN" \
+              --subject "[GMAO] Rapport Monitoring $(date '+%d/%m/%Y %H:%M')" \
+              --message "$MESSAGE"
+            echo "Rapport envoye via SNS"
           else
-            echo "⚠️ Topic SNS introuvable — rapport non envoyé"
+            echo "Topic SNS introuvable"
           fi
 
+      - name: Resume monitoring
+        run: |
+          echo "MONITORING CLOUDWATCH CONFIGURE"
+          echo "Metriques : CPU, Memoire, Disque (toutes les 60s)"
+          echo "Logs      : /gmao/backend, /gmao/frontend, /gmao/system"
+          echo "Alarmes   : gmao-cpu-high, gmao-memory-high, gmao-disk-full"
+          echo "Email     : oumaimabn.amelmm@gmail.com"
+          echo "Dashboard : https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard"
+
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB NOTIFICATION — Résumé final (toujours exécuté)
+#  JOB FINAL — Notification (toujours execute)
 # ════════════════════════════════════════════════════════════════════════════
   job_notify:
-    name: "JOB FINAL — Notification & Résumé"
+    name: "JOB FINAL — Notification et Resume"
     runs-on: ubuntu-latest
     needs: [job1_create_vm, job2_post_install, job3_start_app, job4_monitoring]
     if: always() && github.event.inputs.destroy_infra != 'true'
@@ -840,89 +775,66 @@ Logs complets : ${{ github.server_url }}/${{ github.repository }}/actions/runs/$
       JM_STATUS:  ${{ needs.job4_monitoring.result }}
 
     steps:
-      - name: 📋 Résumé complet du déploiement (logs)
+      - name: Resume complet du deploiement (logs)
         run: |
-          echo ""
-          echo "╔══════════════════════════════════════════════════════════════════╗"
-          echo "║               RAPPORT DE DÉPLOIEMENT GMAO                       ║"
-          echo "╠══════════════════════════════════════════════════════════════════╣"
-          echo "║  Date          : $(date '+%d/%m/%Y %H:%M:%S')"
-          echo "║  Branche       : ${{ github.ref_name }}"
-          echo "║  Commit        : ${{ github.sha }}"
-          echo "║  Déclenché par : ${{ github.actor }}"
-          echo "╠══════════════════════════════════════════════════════════════════╣"
-          echo "║  STATUT DES JOBS"
-          echo "║  ├── JOB 0 — Validation code  : ${{ needs.job0_validate_code.result }}"
-          echo "║  ├── JOB 1 — VM EC2           : ${{ needs.job1_create_vm.result }}"
-
+          echo "RAPPORT DE DEPLOIEMENT GMAO"
+          echo "Date          : $(date '+%d/%m/%Y %H:%M:%S')"
+          echo "Branche       : ${{ github.ref_name }}"
+          echo "Commit        : ${{ github.sha }}"
+          echo "Declenche par : ${{ github.actor }}"
+          echo "---"
+          echo "JOB 0 — Validation code : ${{ needs.job0_validate_code.result }}"
+          echo "JOB 1 — VM EC2          : ${{ needs.job1_create_vm.result }}"
           if [ "$VM_SKIPPED" = "true" ]; then
-            echo "║  ├── JOB 2 — Post-install     : ⏭️  skippé (VM déjà active)"
-            echo "║  ├── JOB 3 — Démarrage app    : ⏭️  skippé (VM déjà active)"
-            echo "║  ├── JOB M — Monitoring       : ⏭️  skippé (VM déjà active)"
+            echo "JOB 2 — Post-install    : skippe (VM deja active)"
+            echo "JOB 3 — Demarrage app   : skippe (VM deja active)"
+            echo "JOB 4 — Monitoring      : skippe (VM deja active)"
           else
-            echo "║  ├── JOB 2 — Post-install     : ${{ needs.job2_post_install.result }}"
-            echo "║  ├── JOB 3 — Démarrage app    : ${{ needs.job3_start_app.result }}"
-            echo "║  └── JOB M — Monitoring       : ${{ needs.job4_monitoring.result }}"
+            echo "JOB 2 — Post-install    : ${{ needs.job2_post_install.result }}"
+            echo "JOB 3 — Demarrage app   : ${{ needs.job3_start_app.result }}"
+            echo "JOB 4 — Monitoring      : ${{ needs.job4_monitoring.result }}"
           fi
-
-          echo "╠══════════════════════════════════════════════════════════════════╣"
-
+          echo "---"
           if [ "$VM_SKIPPED" = "true" ]; then
-            echo "║  ♻️  VM DÉJÀ ACTIVE — aucun déploiement effectué"
-            echo "║  Pour forcer un re-déploiement : force_recreate_vm = true"
-          else
-            if [ "$J1_STATUS" = "success" ] && [ "$J3_STATUS" = "success" ]; then
-              echo "║  ✅  DÉPLOIEMENT RÉUSSI"
-            elif [ "$J1_STATUS" = "failure" ]; then
-              echo "║  ❌  ÉCHEC — La création de la VM a échoué"
-            elif [ "$J2_STATUS" = "failure" ]; then
-              echo "║  ❌  ÉCHEC — Le post-install a échoué"
-            elif [ "$J3_STATUS" = "failure" ]; then
-              echo "║  ❌  ÉCHEC — Le démarrage de l'application a échoué"
-            else
-              echo "║  ⚠️  STATUT INCONNU"
-            fi
-            echo "║"
-            echo "║  URLS DE L'APPLICATION"
-            echo "║  ├── Backend  (Spring Boot) → http://$VM_IP:8080"
-            echo "║  ├── Frontend (Angular)     → http://$VM_IP:4200"
-            echo "║  └── SSH                    → ssh -i labsuser.pem ubuntu@$VM_IP"
-            echo "║"
-            echo "║  MONITORING"
-            echo "║  └── Dashboard → CloudWatch → GMAO-Dashboard"
+            echo "VM DEJA ACTIVE — aucun deploiement effectue"
+          elif [ "$J1_STATUS" = "success" ] && [ "$J3_STATUS" = "success" ]; then
+            echo "DEPLOIEMENT REUSSI"
+            echo "Backend  : http://$VM_IP:8080"
+            echo "Frontend : http://$VM_IP:4200"
+            echo "SSH      : ssh -i labsuser.pem ubuntu@$VM_IP"
+            echo "Dashboard: CloudWatch → GMAO-Dashboard"
+          elif [ "$J1_STATUS" = "failure" ]; then
+            echo "ECHEC — Creation VM echouee"
+          elif [ "$J2_STATUS" = "failure" ]; then
+            echo "ECHEC — Post-install echoue"
+          elif [ "$J3_STATUS" = "failure" ]; then
+            echo "ECHEC — Demarrage application echoue"
           fi
+          echo "Logs : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-          echo "╠══════════════════════════════════════════════════════════════════╣"
-          echo "║  Logs → ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          echo "╚══════════════════════════════════════════════════════════════════╝"
-
-      - name: 📧 Envoi email résultat pipeline via Gmail SMTP
+      - name: Envoi email resultat pipeline via Gmail SMTP
         run: |
-          # Déterminer statut et sujet
           if [ "${{ needs.job1_create_vm.outputs.vm_skipped }}" = "true" ]; then
-            STATUT="♻️ VM DEJA ACTIVE — aucun deploiement effectue"
-            SUJET="[GMAO] ♻️ VM déjà active — $(date '+%d/%m/%Y %H:%M')"
-            EMOJI="♻️"
-          elif [ "${{ needs.job1_create_vm.result }}" = "success" ] &&                [ "${{ needs.job3_start_app.result }}" = "success" ]; then
-            STATUT="✅ DEPLOIEMENT REUSSI"
-            SUJET="[GMAO] ✅ Déploiement réussi — ${{ github.ref_name }}"
-            EMOJI="✅"
+            STATUT="VM DEJA ACTIVE — aucun deploiement effectue"
+            SUJET="[GMAO] VM deja active — $(date '+%d/%m/%Y %H:%M')"
+          elif [ "${{ needs.job1_create_vm.result }}" = "success" ] && \
+               [ "${{ needs.job3_start_app.result }}" = "success" ]; then
+            STATUT="DEPLOIEMENT REUSSI"
+            SUJET="[GMAO] Deploiement reussi — ${{ github.ref_name }}"
           else
-            STATUT="❌ DEPLOIEMENT ECHOUE"
-            SUJET="[GMAO] ❌ Déploiement échoué — ${{ github.ref_name }}"
-            EMOJI="❌"
+            STATUT="DEPLOIEMENT ECHOUE"
+            SUJET="[GMAO] Deploiement echoue — ${{ github.ref_name }}"
           fi
 
-          # Corps de l'email
           BODY="Bonjour,
 
-$EMOJI RAPPORT DE DEPLOIEMENT GMAO
-=====================================
-Date        : $(date '+%d/%m/%Y %H:%M:%S')
-Statut      : $STATUT
-Branche     : ${{ github.ref_name }}
-Commit      : ${{ github.sha }}
-Declenche   : ${{ github.actor }}
+RAPPORT DE DEPLOIEMENT GMAO
+============================
+Date      : $(date '+%d/%m/%Y %H:%M:%S')
+Statut    : $STATUT
+Branche   : ${{ github.ref_name }}
+Commit    : ${{ github.sha }}
+Auteur    : ${{ github.actor }}
 
 STATUT DES JOBS
 ---------------
@@ -932,7 +844,7 @@ JOB 2 - Post-install    : ${{ needs.job2_post_install.result }}
 JOB 3 - Demarrage app   : ${{ needs.job3_start_app.result }}
 JOB 4 - Monitoring      : ${{ needs.job4_monitoring.result }}
 
-URLS DE L'APPLICATION
+URLS DE L APPLICATION
 ---------------------
 Backend  : http://${{ needs.job1_create_vm.outputs.public_ip }}:8080
 Frontend : http://${{ needs.job1_create_vm.outputs.public_ip }}:4200
@@ -940,19 +852,17 @@ SSH      : ssh -i labsuser.pem ubuntu@${{ needs.job1_create_vm.outputs.public_ip
 
 MONITORING
 ----------
-Dashboard CloudWatch : https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard
+Dashboard : https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard
 
-LOGS COMPLETS
--------------
+LOGS
+----
 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
 Cordialement,
 GitHub Actions — GMAO Pipeline"
 
-          # Installer msmtp
           sudo apt-get install -y msmtp msmtp-mta -q
 
-          # Configuration msmtp Gmail
           cat > ~/.msmtprc << MSMTP
 defaults
 auth           on
@@ -971,45 +881,32 @@ account default : gmail
 MSMTP
           chmod 600 ~/.msmtprc
 
-          # Envoi de l'email
-          printf "To: oumaimabn.amelmm@gmail.com
-From: %s
-Subject: %s
-Content-Type: text/plain; charset=UTF-8
-
-%s"             "${{ secrets.GMAIL_USER }}" "$SUJET" "$BODY" |             msmtp "oumaimabn.amelmm@gmail.com" &&             echo "✅ Email résultat pipeline envoyé à oumaimabn.amelmm@gmail.com" ||             echo "❌ Échec envoi email — vérifiez GMAIL_USER et GMAIL_PASSWORD"
+          printf "To: oumaimabn.amelmm@gmail.com\nFrom: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s" \
+            "${{ secrets.GMAIL_USER }}" "$SUJET" "$BODY" | \
+            msmtp "oumaimabn.amelmm@gmail.com" && \
+            echo "Email envoye a oumaimabn.amelmm@gmail.com" || \
+            echo "Echec envoi email — verifiez GMAIL_USER et GMAIL_PASSWORD"
 
 # ════════════════════════════════════════════════════════════════════════════
-#  [DÉSACTIVÉ] — Terraform Destroy (commenté — remplacé par JOB 4 Monitoring)
-#
+#  [DESACTIVE] — Terraform Destroy
 #  job4_destroy:
-#    name: "JOB 4 — Terraform Destroy"
+#    name: "JOB — Terraform Destroy"
 #    runs-on: ubuntu-latest
-#    if: ${{ github.event.inputs.destroy_infra == 'true' }}
+#    if: github.event.inputs.destroy_infra == 'true'
 #    steps:
-#      - name: Checkout du dépôt
-#        uses: actions/checkout@v4
-#      - name: Configuration credentials AWS
-#        uses: aws-actions/configure-aws-credentials@v4
+#      - uses: actions/checkout@v4
+#      - uses: aws-actions/configure-aws-credentials@v4
 #        with:
 #          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
 #          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 #          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
 #          aws-region:            ${{ env.AWS_REGION }}
-#      - name: Setup Terraform
-#        uses: hashicorp/setup-terraform@v3
+#      - uses: hashicorp/setup-terraform@v3
 #        with:
 #          terraform_version: "1.6.0"
 #          terraform_wrapper: false
-#      - name: Terraform Init
+#      - run: terraform init
 #        working-directory: ${{ env.TF_DIR }}
-#        run: terraform init
-#      - name: Terraform Plan (destroy)
+#      - run: terraform destroy -auto-approve
 #        working-directory: ${{ env.TF_DIR }}
-#        run: terraform plan -destroy -out=tfplan-destroy
-#      - name: Terraform Destroy
-#        working-directory: ${{ env.TF_DIR }}
-#        run: terraform apply -auto-approve tfplan-destroy
-#      - name: Confirmation de destruction
-#        run: echo "Infrastructure détruite"
 # ════════════════════════════════════════════════════════════════════════════
