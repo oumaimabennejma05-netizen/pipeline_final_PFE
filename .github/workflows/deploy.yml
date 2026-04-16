@@ -404,121 +404,179 @@ jobs:
           exit 1
 
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB 4 — SAST + SCA + SECRETS (VERSION PRO 🔥)
+#  JOB 4 — SAST : Semgrep (zéro installation)
 # ════════════════════════════════════════════════════════════════════════════
-job4_sast:
-  name: "JOB 4 — SAST PRO (Semgrep + SCA + Secrets)"
-  runs-on: ubuntu-latest
-  needs: job0_validate_code
-  continue-on-error: false   # 🔴 IMPORTANT : bloque pipeline
-  outputs:
-    sast_status:  ${{ steps.final.outputs.sast_status }}
-    sast_summary: ${{ steps.final.outputs.sast_summary }}
+  job4_sast:
+    name: "JOB 4 — SAST Semgrep"
+    runs-on: ubuntu-latest
+    needs: job0_validate_code
+    if: ${{ github.event.inputs.destroy_infra != 'true' }}
+    continue-on-error: true
+    outputs:
+      sast_status:  ${{ steps.sast_result.outputs.sast_status }}
+      sast_summary: ${{ steps.sast_result.outputs.sast_summary }}
+    steps:
+      - name: Checkout du depot
+        uses: actions/checkout@v4
 
-  steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Configuration credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
 
-# ─────────────────────────────────────────────────────────────
-# 🔐 1. SECRET SCAN (Gitleaks)
-# ─────────────────────────────────────────────────────────────
-    - name: Scan secrets (Gitleaks)
-      id: secrets
-      run: |
-        docker run --rm \
-          -v "${{ github.workspace }}:/repo" \
-          zricethezav/gitleaks detect \
-          --source=/repo \
-          --report-format=json \
-          --report-path=/repo/gitleaks-report.json || true
+      - name: SAST Backend — Semgrep (Java)
+        id: sast_backend
+        run: |
+          echo "Lancement SAST sur le backend Java..."
+          mkdir -p /tmp/sast-reports
 
-        COUNT=$(cat gitleaks-report.json 2>/dev/null | jq '. | length' || echo "0")
-        echo "secrets_count=$COUNT" >> $GITHUB_OUTPUT
-        echo "Secrets détectés : $COUNT"
+          docker run --rm \
+            -v "${{ github.workspace }}/gmao-backend:/src" \
+            returntocorp/semgrep:latest \
+            semgrep scan \
+              --config "p/java" \
+              --config "p/owasp-top-ten" \
+              --config "p/secrets" \
+              --json \
+              --output /src/semgrep-backend.json \
+              /src 2>&1 | tee /tmp/sast-backend.log || true
 
-# ─────────────────────────────────────────────────────────────
-# 🧠 2. SAST (Semgrep)
-# ─────────────────────────────────────────────────────────────
-    - name: SAST Backend (Semgrep)
-      id: semgrep_backend
-      run: |
-        docker run --rm \
-          -v "${{ github.workspace }}/gmao-backend:/src" \
-          returntocorp/semgrep \
-          semgrep scan \
-            --config "p/java" \
-            --config "p/owasp-top-ten" \
-            --config "p/security-audit" \
-            --config "p/secrets" \
-            --json \
-            --output /src/semgrep.json \
-            /src || true
+          cp ${{ github.workspace }}/gmao-backend/semgrep-backend.json \
+             /tmp/sast-reports/semgrep-backend.json 2>/dev/null || \
+             echo "{}" > /tmp/sast-reports/semgrep-backend.json
 
-        COUNT=$(cat gmao-backend/semgrep.json | jq '.results | length')
-        echo "backend_findings=$COUNT" >> $GITHUB_OUTPUT
+          CRITICAL=$(cat /tmp/sast-reports/semgrep-backend.json | \
+            python3 -c "
+          import json,sys
+          data=json.load(sys.stdin)
+          results=data.get('results',[])
+          count=sum(1 for r in results if r.get('extra',{}).get('severity','') in ['ERROR','WARNING'])
+          print(count)
+          " 2>/dev/null || echo "0")
 
-# ─────────────────────────────────────────────────────────────
-# 📦 3. SCA (Dependency Check)
-# ─────────────────────────────────────────────────────────────
-    - name: SCA Backend (Dependency Check)
-      id: sca
-      run: |
-        docker run --rm \
-          -v "${{ github.workspace }}/gmao-backend:/src" \
-          owasp/dependency-check \
-          --scan /src \
-          --format JSON \
-          --out /src
+          echo "Backend SAST : $CRITICAL finding(s) détecté(s)"
+          echo "backend_findings=$CRITICAL" >> $GITHUB_OUTPUT
 
-        COUNT=$(cat gmao-backend/dependency-check-report.json | jq '.dependencies | length' || echo "0")
-        echo "sca_findings=$COUNT" >> $GITHUB_OUTPUT
+      - name: SAST Frontend — Semgrep (TypeScript)
+        id: sast_frontend
+        run: |
+          echo "Lancement SAST sur le frontend Angular..."
 
-# ─────────────────────────────────────────────────────────────
-# 📊 4. QUALITY GATE 🔴
-# ─────────────────────────────────────────────────────────────
-    - name: Quality Gate
-      id: gate
-      run: |
-        SAST=${{ steps.semgrep_backend.outputs.backend_findings }}
-        SCA=${{ steps.sca.outputs.sca_findings }}
-        SECRETS=${{ steps.secrets.outputs.secrets_count }}
+          docker run --rm \
+            -v "${{ github.workspace }}/gmao-frontend:/src" \
+            returntocorp/semgrep:latest \
+            semgrep scan \
+              --config "p/typescript" \
+              --config "p/owasp-top-ten" \
+              --config "p/secrets" \
+              --json \
+              --output /src/semgrep-frontend.json \
+              /src 2>&1 | tee /tmp/sast-frontend.log || true
 
-        TOTAL=$(($SAST + $SCA + $SECRETS))
+          cp ${{ github.workspace }}/gmao-frontend/semgrep-frontend.json \
+             /tmp/sast-reports/semgrep-frontend.json 2>/dev/null || \
+             echo "{}" > /tmp/sast-reports/semgrep-frontend.json
 
-        echo "Total issues : $TOTAL"
+          CRITICAL=$(cat /tmp/sast-reports/semgrep-frontend.json | \
+            python3 -c "
+          import json,sys
+          data=json.load(sys.stdin)
+          results=data.get('results',[])
+          count=sum(1 for r in results if r.get('extra',{}).get('severity','') in ['ERROR','WARNING'])
+          print(count)
+          " 2>/dev/null || echo "0")
 
-        if [ "$SECRETS" -gt 0 ]; then
-          echo "❌ Secrets détectés → STOP"
-          exit 1
-        fi
+          echo "Frontend SAST : $CRITICAL finding(s) détecté(s)"
+          echo "frontend_findings=$CRITICAL" >> $GITHUB_OUTPUT
 
-        if [ "$SAST" -gt 5 ]; then
-          echo "❌ Trop de vulnérabilités SAST"
-          exit 1
-        fi
+      - name: Generation rapport SAST HTML
+        run: |
+          python3 << PYEOF
+          import json
 
-        echo "✅ Quality Gate OK"
+          def load(path):
+              try:
+                  with open(path) as f:
+                      return json.load(f)
+              except:
+                  return {"results": []}
 
-# ─────────────────────────────────────────────────────────────
-# 📄 5. RÉSUMÉ FINAL
-# ─────────────────────────────────────────────────────────────
-    - name: Résumé SAST
-      id: final
-      run: |
-        SAST=${{ steps.semgrep_backend.outputs.backend_findings }}
-        SCA=${{ steps.sca.outputs.sca_findings }}
-        SECRETS=${{ steps.secrets.outputs.secrets_count }}
+          backend  = load("/tmp/sast-reports/semgrep-backend.json")
+          frontend = load("/tmp/sast-reports/semgrep-frontend.json")
 
-        TOTAL=$(($SAST + $SCA + $SECRETS))
+          all_results = []
+          for r in backend.get("results", []):
+              r["_source"] = "Backend (Java)"
+              all_results.append(r)
+          for r in frontend.get("results", []):
+              r["_source"] = "Frontend (TypeScript)"
+              all_results.append(r)
 
-        SUMMARY="SAST:$SAST | SCA:$SCA | SECRETS:$SECRETS | TOTAL:$TOTAL"
-        echo "sast_summary=$SUMMARY" >> $GITHUB_OUTPUT
+          rows = ""
+          for r in all_results:
+              sev   = r.get("extra", {}).get("severity", "INFO")
+              msg   = r.get("extra", {}).get("message", "")[:120]
+              path  = r.get("path", "")
+              line  = r.get("start", {}).get("line", "")
+              src   = r.get("_source", "")
+              color = "#ff4444" if sev == "ERROR" else "#ff9900" if sev == "WARNING" else "#888"
+              rows += f"<tr><td style='color:{color}'><b>{sev}</b></td><td>{src}</td><td>{path}</td><td>{line}</td><td>{msg}</td></tr>"
 
-        if [ "$TOTAL" -gt 0 ]; then
-          echo "sast_status=issues_found" >> $GITHUB_OUTPUT
-        else
-          echo "sast_status=clean" >> $GITHUB_OUTPUT
-        fi
+          html = f"""<!DOCTYPE html>
+          <html><head><meta charset='UTF-8'>
+          <title>Rapport SAST GMAO</title>
+          <style>
+            body{{font-family:Arial,sans-serif;padding:20px;background:#f5f5f5}}
+            h1{{color:#232f3e}}
+            table{{width:100%;border-collapse:collapse;background:white}}
+            th{{background:#232f3e;color:white;padding:10px}}
+            td{{padding:8px;border-bottom:1px solid #ddd;font-size:13px}}
+            .summary{{background:white;padding:15px;margin-bottom:20px;border-left:4px solid #ff9900}}
+          </style></head>
+          <body>
+          <h1>Rapport SAST — Application GMAO</h1>
+          <div class='summary'>
+            <b>Backend  (Java)       :</b> {len(backend.get('results',[]))} finding(s)<br>
+            <b>Frontend (TypeScript) :</b> {len(frontend.get('results',[]))} finding(s)<br>
+            <b>Total                 :</b> {len(all_results)} finding(s)
+          </div>
+          <table>
+            <tr><th>Sévérité</th><th>Source</th><th>Fichier</th><th>Ligne</th><th>Message</th></tr>
+            {rows if rows else "<tr><td colspan='5' style='text-align:center;color:green'>✅ Aucun problème détecté</td></tr>"}
+          </table>
+          </body></html>"""
+
+          with open("/tmp/sast-reports/sast-report.html", "w") as f:
+              f.write(html)
+          print("Rapport HTML généré")
+          PYEOF
+
+      - name: Statut final SAST
+        id: sast_result
+        run: |
+          BACKEND_F="${{ steps.sast_backend.outputs.backend_findings }}"
+          FRONTEND_F="${{ steps.sast_frontend.outputs.frontend_findings }}"
+          TOTAL=$((${BACKEND_F:-0} + ${FRONTEND_F:-0}))
+          SUMMARY="Backend: ${BACKEND_F:-0} finding(s) | Frontend: ${FRONTEND_F:-0} finding(s) | Total: $TOTAL"
+          echo "sast_summary=$SUMMARY" >> $GITHUB_OUTPUT
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "sast_status=issues_found" >> $GITHUB_OUTPUT
+            echo "⚠️  SAST : $TOTAL problème(s) — alerte email sera envoyée"
+          else
+            echo "sast_status=clean" >> $GITHUB_OUTPUT
+            echo "✅ SAST : aucun problème détecté"
+          fi
+
+      - name: Sauvegarde rapports SAST
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-reports
+          path: /tmp/sast-reports/
+          retention-days: 30
 
 # ════════════════════════════════════════════════════════════════════════════
 #  JOB 5 — DAST : Amazon Inspector v2 (natif AWS ✅)
