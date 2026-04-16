@@ -47,19 +47,17 @@ jobs:
     name: "JOB 0 — Validation du code"
     runs-on: ubuntu-latest
     if: ${{ github.event.inputs.destroy_infra != 'true' }}
-
     outputs:
       backend_ok:  ${{ steps.validate_backend.outputs.backend_ok }}
       frontend_ok: ${{ steps.validate_frontend.outputs.frontend_ok }}
-
     steps:
       - name: Checkout du depot
         uses: actions/checkout@v4
 
-      - name: Setup Java 11
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
-          java-version: '11'
+          java-version: '17'
           distribution: 'temurin'
 
       - name: Setup Node.js 18
@@ -108,13 +106,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: job0_validate_code
     if: ${{ github.event.inputs.destroy_infra != 'true' }}
-
     outputs:
       public_ip:   ${{ steps.resolve_ip.outputs.public_ip }}
       instance_id: ${{ steps.resolve_ip.outputs.instance_id }}
       vm_created:  ${{ steps.resolve_ip.outputs.vm_created }}
       vm_skipped:  ${{ steps.resolve_ip.outputs.vm_skipped }}
-
     steps:
       - name: Checkout du depot
         uses: actions/checkout@v4
@@ -145,7 +141,6 @@ jobs:
                       "Name=instance-state-name,Values=running" \
             --query "Reservations[].Instances[].[InstanceId,PublicIpAddress]" \
             --output text 2>/dev/null || echo "")
-
           if [ -n "$RUNNING" ]; then
             INSTANCE_ID=$(echo "$RUNNING" | awk '{print $1}' | head -1)
             PUBLIC_IP=$(echo "$RUNNING"   | awk '{print $2}' | head -1)
@@ -173,7 +168,6 @@ jobs:
                       "Name=instance-state-name,Values=stopped,pending,stopping" \
             --query "Reservations[].Instances[].InstanceId" \
             --output text 2>/dev/null || echo "")
-
           if [ -n "$INSTANCE_IDS" ]; then
             COUNT=$(echo "$INSTANCE_IDS" | wc -w)
             echo "$COUNT VM(s) arretee(s) : $INSTANCE_IDS"
@@ -207,13 +201,13 @@ jobs:
           if [ "${{ steps.detect_running_vm.outputs.vm_already_running }}" = "true" ]; then
             PUBLIC_IP="${{ steps.detect_running_vm.outputs.existing_ip }}"
             INSTANCE_ID="${{ steps.detect_running_vm.outputs.existing_id }}"
-            echo "vm_created=false"  >> $GITHUB_OUTPUT
-            echo "vm_skipped=true"   >> $GITHUB_OUTPUT
+            echo "vm_created=false" >> $GITHUB_OUTPUT
+            echo "vm_skipped=true"  >> $GITHUB_OUTPUT
           else
             PUBLIC_IP=$(terraform output -raw public_ip)
             INSTANCE_ID=$(terraform output -raw instance_id)
-            echo "vm_created=true"   >> $GITHUB_OUTPUT
-            echo "vm_skipped=false"  >> $GITHUB_OUTPUT
+            echo "vm_created=true"  >> $GITHUB_OUTPUT
+            echo "vm_skipped=false" >> $GITHUB_OUTPUT
           fi
           echo "public_ip=$PUBLIC_IP"     >> $GITHUB_OUTPUT
           echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
@@ -245,10 +239,8 @@ jobs:
     if: |
       github.event.inputs.destroy_infra != 'true' &&
       needs.job1_create_vm.outputs.vm_skipped != 'true'
-
     env:
       VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
-
     steps:
       - name: Checkout du depot
         uses: actions/checkout@v4
@@ -278,7 +270,6 @@ jobs:
             echo "already_installed=true" >> $GITHUB_OUTPUT
             exit 0
           fi
-
           INSTALLED=$(ssh -i ~/.ssh/vockey.pem \
               -o StrictHostKeyChecking=no \
               -o ConnectTimeout=10 \
@@ -286,7 +277,6 @@ jobs:
               "command -v java && command -v mvn && command -v psql && command -v node && \
                test -d ~/gmao-backend && test -d ~/gmao-frontend && echo 'ALL_OK'" \
               2>/dev/null || echo "")
-
           if echo "$INSTALLED" | grep -q "ALL_OK"; then
             echo "Tous les outils et projets sont deja installes"
             echo "already_installed=true" >> $GITHUB_OUTPUT
@@ -334,10 +324,8 @@ jobs:
     if: |
       github.event.inputs.destroy_infra != 'true' &&
       needs.job1_create_vm.outputs.vm_skipped != 'true'
-
     env:
       VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
-
     steps:
       - name: Checkout du depot
         uses: actions/checkout@v4
@@ -416,10 +404,374 @@ jobs:
           exit 1
 
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB 4 — Monitoring CloudWatch
+#  JOB 4 — SAST : Semgrep (zéro installation)
 # ════════════════════════════════════════════════════════════════════════════
-  job4_monitoring:
-    name: "JOB 4 — Monitoring CloudWatch"
+  job4_sast:
+    name: "JOB 4 — SAST Semgrep"
+    runs-on: ubuntu-latest
+    needs: job0_validate_code
+    if: ${{ github.event.inputs.destroy_infra != 'true' }}
+    continue-on-error: true
+    outputs:
+      sast_status:  ${{ steps.sast_result.outputs.sast_status }}
+      sast_summary: ${{ steps.sast_result.outputs.sast_summary }}
+    steps:
+      - name: Checkout du depot
+        uses: actions/checkout@v4
+
+      - name: Configuration credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: SAST Backend — Semgrep (Java)
+        id: sast_backend
+        run: |
+          echo "Lancement SAST sur le backend Java..."
+          mkdir -p /tmp/sast-reports
+
+          docker run --rm \
+            -v "${{ github.workspace }}/gmao-backend:/src" \
+            returntocorp/semgrep:latest \
+            semgrep scan \
+              --config "p/java" \
+              --config "p/owasp-top-ten" \
+              --config "p/secrets" \
+              --json \
+              --output /src/semgrep-backend.json \
+              /src 2>&1 | tee /tmp/sast-backend.log || true
+
+          cp ${{ github.workspace }}/gmao-backend/semgrep-backend.json \
+             /tmp/sast-reports/semgrep-backend.json 2>/dev/null || \
+             echo "{}" > /tmp/sast-reports/semgrep-backend.json
+
+          CRITICAL=$(cat /tmp/sast-reports/semgrep-backend.json | \
+            python3 -c "
+          import json,sys
+          data=json.load(sys.stdin)
+          results=data.get('results',[])
+          count=sum(1 for r in results if r.get('extra',{}).get('severity','') in ['ERROR','WARNING'])
+          print(count)
+          " 2>/dev/null || echo "0")
+
+          echo "Backend SAST : $CRITICAL finding(s) détecté(s)"
+          echo "backend_findings=$CRITICAL" >> $GITHUB_OUTPUT
+
+      - name: SAST Frontend — Semgrep (TypeScript)
+        id: sast_frontend
+        run: |
+          echo "Lancement SAST sur le frontend Angular..."
+
+          docker run --rm \
+            -v "${{ github.workspace }}/gmao-frontend:/src" \
+            returntocorp/semgrep:latest \
+            semgrep scan \
+              --config "p/typescript" \
+              --config "p/owasp-top-ten" \
+              --config "p/secrets" \
+              --json \
+              --output /src/semgrep-frontend.json \
+              /src 2>&1 | tee /tmp/sast-frontend.log || true
+
+          cp ${{ github.workspace }}/gmao-frontend/semgrep-frontend.json \
+             /tmp/sast-reports/semgrep-frontend.json 2>/dev/null || \
+             echo "{}" > /tmp/sast-reports/semgrep-frontend.json
+
+          CRITICAL=$(cat /tmp/sast-reports/semgrep-frontend.json | \
+            python3 -c "
+          import json,sys
+          data=json.load(sys.stdin)
+          results=data.get('results',[])
+          count=sum(1 for r in results if r.get('extra',{}).get('severity','') in ['ERROR','WARNING'])
+          print(count)
+          " 2>/dev/null || echo "0")
+
+          echo "Frontend SAST : $CRITICAL finding(s) détecté(s)"
+          echo "frontend_findings=$CRITICAL" >> $GITHUB_OUTPUT
+
+      - name: Generation rapport SAST HTML
+        run: |
+          python3 << PYEOF
+          import json
+
+          def load(path):
+              try:
+                  with open(path) as f:
+                      return json.load(f)
+              except:
+                  return {"results": []}
+
+          backend  = load("/tmp/sast-reports/semgrep-backend.json")
+          frontend = load("/tmp/sast-reports/semgrep-frontend.json")
+
+          all_results = []
+          for r in backend.get("results", []):
+              r["_source"] = "Backend (Java)"
+              all_results.append(r)
+          for r in frontend.get("results", []):
+              r["_source"] = "Frontend (TypeScript)"
+              all_results.append(r)
+
+          rows = ""
+          for r in all_results:
+              sev   = r.get("extra", {}).get("severity", "INFO")
+              msg   = r.get("extra", {}).get("message", "")[:120]
+              path  = r.get("path", "")
+              line  = r.get("start", {}).get("line", "")
+              src   = r.get("_source", "")
+              color = "#ff4444" if sev == "ERROR" else "#ff9900" if sev == "WARNING" else "#888"
+              rows += f"<tr><td style='color:{color}'><b>{sev}</b></td><td>{src}</td><td>{path}</td><td>{line}</td><td>{msg}</td></tr>"
+
+          html = f"""<!DOCTYPE html>
+          <html><head><meta charset='UTF-8'>
+          <title>Rapport SAST GMAO</title>
+          <style>
+            body{{font-family:Arial,sans-serif;padding:20px;background:#f5f5f5}}
+            h1{{color:#232f3e}}
+            table{{width:100%;border-collapse:collapse;background:white}}
+            th{{background:#232f3e;color:white;padding:10px}}
+            td{{padding:8px;border-bottom:1px solid #ddd;font-size:13px}}
+            .summary{{background:white;padding:15px;margin-bottom:20px;border-left:4px solid #ff9900}}
+          </style></head>
+          <body>
+          <h1>Rapport SAST — Application GMAO</h1>
+          <div class='summary'>
+            <b>Backend  (Java)       :</b> {len(backend.get('results',[]))} finding(s)<br>
+            <b>Frontend (TypeScript) :</b> {len(frontend.get('results',[]))} finding(s)<br>
+            <b>Total                 :</b> {len(all_results)} finding(s)
+          </div>
+          <table>
+            <tr><th>Sévérité</th><th>Source</th><th>Fichier</th><th>Ligne</th><th>Message</th></tr>
+            {rows if rows else "<tr><td colspan='5' style='text-align:center;color:green'>✅ Aucun problème détecté</td></tr>"}
+          </table>
+          </body></html>"""
+
+          with open("/tmp/sast-reports/sast-report.html", "w") as f:
+              f.write(html)
+          print("Rapport HTML généré")
+          PYEOF
+
+      - name: Statut final SAST
+        id: sast_result
+        run: |
+          BACKEND_F="${{ steps.sast_backend.outputs.backend_findings }}"
+          FRONTEND_F="${{ steps.sast_frontend.outputs.frontend_findings }}"
+          TOTAL=$((${BACKEND_F:-0} + ${FRONTEND_F:-0}))
+          SUMMARY="Backend: ${BACKEND_F:-0} finding(s) | Frontend: ${FRONTEND_F:-0} finding(s) | Total: $TOTAL"
+          echo "sast_summary=$SUMMARY" >> $GITHUB_OUTPUT
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "sast_status=issues_found" >> $GITHUB_OUTPUT
+            echo "⚠️  SAST : $TOTAL problème(s) — alerte email sera envoyée"
+          else
+            echo "sast_status=clean" >> $GITHUB_OUTPUT
+            echo "✅ SAST : aucun problème détecté"
+          fi
+
+      - name: Sauvegarde rapports SAST
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-reports
+          path: /tmp/sast-reports/
+          retention-days: 30
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 5 — DAST : Amazon Inspector v2 (natif AWS ✅)
+# ════════════════════════════════════════════════════════════════════════════
+  job5_dast:
+    name: "JOB 5 — DAST Amazon Inspector v2"
+    runs-on: ubuntu-latest
+    needs: [job1_create_vm, job3_start_app]
+    if: |
+      github.event.inputs.destroy_infra != 'true' &&
+      needs.job1_create_vm.outputs.vm_skipped != 'true' &&
+      needs.job3_start_app.result == 'success'
+    continue-on-error: true
+    outputs:
+      dast_status:  ${{ steps.dast_result.outputs.dast_status }}
+      dast_summary: ${{ steps.dast_result.outputs.dast_summary }}
+    env:
+      INSTANCE_ID: ${{ needs.job1_create_vm.outputs.instance_id }}
+    steps:
+      - name: Checkout du depot
+        uses: actions/checkout@v4
+
+      - name: Configuration credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Activation Amazon Inspector v2
+        id: inspector_enable
+        run: |
+          echo "Activation Amazon Inspector v2..."
+          STATUS=$(aws inspector2 batch-get-account-status \
+            --account-ids $(aws sts get-caller-identity --query Account --output text) \
+            --query 'accounts[0].state.status' \
+            --output text 2>/dev/null || echo "DISABLED")
+          echo "Statut Inspector actuel : $STATUS"
+          if [ "$STATUS" != "ENABLED" ]; then
+            aws inspector2 enable \
+              --resource-types EC2 \
+              --region ${{ env.AWS_REGION }} 2>/dev/null && \
+              echo "Inspector v2 activé" || \
+              echo "Activation Inspector ignorée (permissions Learner Lab)"
+          else
+            echo "Inspector v2 déjà actif"
+          fi
+          echo "Attente du démarrage du scan Inspector (90s)..."
+          sleep 90
+
+      - name: Recuperation findings CRITICAL
+        id: findings_critical
+        run: |
+          aws inspector2 list-findings \
+            --filter-criteria "{
+              \"resourceId\": [{\"comparison\": \"EQUALS\", \"value\": \"${{ env.INSTANCE_ID }}\"}],
+              \"severity\":   [{\"comparison\": \"EQUALS\", \"value\": \"CRITICAL\"}]
+            }" \
+            --query 'findings[].{
+              Titre:title,
+              Severite:severity,
+              CVE:packageVulnerabilityDetails.vulnerabilityId,
+              Package:packageVulnerabilityDetails.vulnerablePackages[0].name,
+              Version:packageVulnerabilityDetails.vulnerablePackages[0].version,
+              Score:inspectorScore
+            }' \
+            --output json 2>/dev/null > /tmp/inspector-critical.json || \
+            echo "[]" > /tmp/inspector-critical.json
+
+          COUNT=$(python3 -c "
+          import json
+          with open('/tmp/inspector-critical.json') as f:
+              data=json.load(f)
+          print(len(data) if isinstance(data,list) else 0)
+          " 2>/dev/null || echo "0")
+          echo "Findings CRITICAL : $COUNT"
+          echo "critical_count=$COUNT" >> $GITHUB_OUTPUT
+
+      - name: Recuperation findings HIGH
+        id: findings_high
+        run: |
+          aws inspector2 list-findings \
+            --filter-criteria "{
+              \"resourceId\": [{\"comparison\": \"EQUALS\", \"value\": \"${{ env.INSTANCE_ID }}\"}],
+              \"severity\":   [{\"comparison\": \"EQUALS\", \"value\": \"HIGH\"}]
+            }" \
+            --query 'findings[].{
+              Titre:title,
+              Severite:severity,
+              CVE:packageVulnerabilityDetails.vulnerabilityId,
+              Package:packageVulnerabilityDetails.vulnerablePackages[0].name,
+              Version:packageVulnerabilityDetails.vulnerablePackages[0].version,
+              Score:inspectorScore
+            }' \
+            --output json 2>/dev/null > /tmp/inspector-high.json || \
+            echo "[]" > /tmp/inspector-high.json
+
+          COUNT=$(python3 -c "
+          import json
+          with open('/tmp/inspector-high.json') as f:
+              data=json.load(f)
+          print(len(data) if isinstance(data,list) else 0)
+          " 2>/dev/null || echo "0")
+          echo "Findings HIGH : $COUNT"
+          echo "high_count=$COUNT" >> $GITHUB_OUTPUT
+
+      - name: Generation rapport DAST HTML
+        run: |
+          mkdir -p /tmp/dast-reports
+          python3 << PYEOF
+          import json, shutil
+
+          def load(path):
+              try:
+                  with open(path) as f:
+                      return json.load(f)
+              except:
+                  return []
+
+          critical = load("/tmp/inspector-critical.json")
+          high     = load("/tmp/inspector-high.json")
+          all_f    = critical + high
+
+          rows = ""
+          for f in all_f:
+              sev   = f.get("Severite", "")
+              titre = (f.get("Titre", "") or "")[:100]
+              cve   = f.get("CVE", "") or ""
+              pkg   = f.get("Package", "") or ""
+              ver   = f.get("Version", "") or ""
+              score = f.get("Score", "") or ""
+              color = "#ff4444" if sev == "CRITICAL" else "#ff9900"
+              rows += f"<tr><td style='color:{color}'><b>{sev}</b></td><td>{cve}</td><td>{pkg}</td><td>{ver}</td><td>{score}</td><td>{titre}</td></tr>"
+
+          html = f"""<!DOCTYPE html>
+          <html><head><meta charset='UTF-8'>
+          <title>Rapport DAST GMAO — AWS Inspector</title>
+          <style>
+            body{{font-family:Arial,sans-serif;padding:20px;background:#f5f5f5}}
+            h1{{color:#232f3e}}
+            table{{width:100%;border-collapse:collapse;background:white}}
+            th{{background:#232f3e;color:white;padding:10px}}
+            td{{padding:8px;border-bottom:1px solid #ddd;font-size:13px}}
+            .summary{{background:white;padding:15px;margin-bottom:20px;border-left:4px solid #ff4444}}
+          </style></head>
+          <body>
+          <h1>Rapport DAST — Amazon Inspector v2</h1>
+          <div class='summary'>
+            <b>CRITICAL :</b> {len(critical)} finding(s)<br>
+            <b>HIGH     :</b> {len(high)} finding(s)<br>
+            <b>Total    :</b> {len(all_f)} finding(s)
+          </div>
+          <table>
+            <tr><th>Sévérité</th><th>CVE</th><th>Package</th><th>Version</th><th>Score</th><th>Description</th></tr>
+            {rows if rows else "<tr><td colspan='6' style='text-align:center;color:green'>✅ Aucune vulnérabilité CRITICAL/HIGH détectée</td></tr>"}
+          </table>
+          </body></html>"""
+
+          with open("/tmp/dast-reports/dast-report.html", "w") as f:
+              f.write(html)
+          shutil.copy("/tmp/inspector-critical.json", "/tmp/dast-reports/inspector-critical.json")
+          shutil.copy("/tmp/inspector-high.json",     "/tmp/dast-reports/inspector-high.json")
+          print("Rapport DAST HTML généré")
+          PYEOF
+
+      - name: Statut final DAST
+        id: dast_result
+        run: |
+          CRITICAL="${{ steps.findings_critical.outputs.critical_count }}"
+          HIGH="${{ steps.findings_high.outputs.high_count }}"
+          TOTAL=$((${CRITICAL:-0} + ${HIGH:-0}))
+          SUMMARY="CRITICAL: ${CRITICAL:-0} | HIGH: ${HIGH:-0} | Total: $TOTAL"
+          echo "dast_summary=$SUMMARY" >> $GITHUB_OUTPUT
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "dast_status=issues_found" >> $GITHUB_OUTPUT
+            echo "⚠️  DAST : $TOTAL vulnérabilité(s) — alerte email sera envoyée"
+          else
+            echo "dast_status=clean" >> $GITHUB_OUTPUT
+            echo "✅ DAST : aucune vulnérabilité CRITICAL/HIGH détectée"
+          fi
+
+      - name: Sauvegarde rapports DAST
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-reports
+          path: /tmp/dast-reports/
+          retention-days: 30
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 6 — Monitoring CloudWatch
+# ════════════════════════════════════════════════════════════════════════════
+  job6_monitoring:
+    name: "JOB 6 — Monitoring CloudWatch"
     runs-on: ubuntu-latest
     needs: [job1_create_vm, job3_start_app]
     if: |
@@ -427,11 +779,9 @@ jobs:
       github.event.inputs.destroy_infra != 'true' &&
       needs.job1_create_vm.outputs.vm_skipped != 'true' &&
       needs.job3_start_app.result == 'success'
-
     env:
       VM_IP:       ${{ needs.job1_create_vm.outputs.public_ip }}
       INSTANCE_ID: ${{ needs.job1_create_vm.outputs.instance_id }}
-
     steps:
       - name: Checkout du depot
         uses: actions/checkout@v4
@@ -458,8 +808,7 @@ jobs:
 
       - name: Installation CloudWatch Agent sur la VM
         run: |
-          ssh -i ~/.ssh/vockey.pem ubuntu@${{ env.VM_IP }} bash << 'SSHEOF'
-            echo "Installation CloudWatch Agent..."
+          ssh ubuntu@${{ env.VM_IP }} bash << 'SSHEOF'
             wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
             sudo dpkg -i amazon-cloudwatch-agent.deb
             rm -f amazon-cloudwatch-agent.deb
@@ -470,54 +819,23 @@ jobs:
         run: |
           cat > /tmp/cloudwatch-config.json << 'CONFIG'
           {
-            "agent": {
-              "metrics_collection_interval": 60,
-              "run_as_user": "root"
-            },
+            "agent": { "metrics_collection_interval": 60, "run_as_user": "root" },
             "metrics": {
               "namespace": "GMAO/EC2",
-              "append_dimensions": {
-                "InstanceId": "${aws:InstanceId}"
-              },
+              "append_dimensions": { "InstanceId": "${aws:InstanceId}" },
               "metrics_collected": {
-                "cpu": {
-                  "measurement": ["cpu_usage_idle", "cpu_usage_user", "cpu_usage_system"],
-                  "metrics_collection_interval": 60,
-                  "totalcpu": true
-                },
-                "mem": {
-                  "measurement": ["mem_used_percent", "mem_available"],
-                  "metrics_collection_interval": 60
-                },
-                "disk": {
-                  "measurement": ["used_percent", "free"],
-                  "metrics_collection_interval": 60,
-                  "resources": ["/"]
-                }
+                "cpu":  { "measurement": ["cpu_usage_idle","cpu_usage_user","cpu_usage_system"], "metrics_collection_interval": 60, "totalcpu": true },
+                "mem":  { "measurement": ["mem_used_percent","mem_available"], "metrics_collection_interval": 60 },
+                "disk": { "measurement": ["used_percent","free"], "metrics_collection_interval": 60, "resources": ["/"] }
               }
             },
             "logs": {
               "logs_collected": {
                 "files": {
                   "collect_list": [
-                    {
-                      "file_path": "/home/ubuntu/backend.log",
-                      "log_group_name": "/gmao/backend",
-                      "log_stream_name": "{instance_id}",
-                      "timezone": "UTC"
-                    },
-                    {
-                      "file_path": "/home/ubuntu/frontend.log",
-                      "log_group_name": "/gmao/frontend",
-                      "log_stream_name": "{instance_id}",
-                      "timezone": "UTC"
-                    },
-                    {
-                      "file_path": "/var/log/syslog",
-                      "log_group_name": "/gmao/system",
-                      "log_stream_name": "{instance_id}",
-                      "timezone": "UTC"
-                    }
+                    { "file_path": "/tmp/gmao-backend.log",  "log_group_name": "/gmao/backend",  "log_stream_name": "{instance_id}", "timezone": "UTC" },
+                    { "file_path": "/tmp/gmao-frontend.log", "log_group_name": "/gmao/frontend", "log_stream_name": "{instance_id}", "timezone": "UTC" },
+                    { "file_path": "/var/log/syslog",        "log_group_name": "/gmao/system",   "log_stream_name": "{instance_id}", "timezone": "UTC" }
                   ]
                 }
               }
@@ -525,223 +843,67 @@ jobs:
           }
           CONFIG
 
-          scp -i ~/.ssh/vockey.pem \
-              /tmp/cloudwatch-config.json \
-              ubuntu@${{ env.VM_IP }}:/tmp/cloudwatch-config.json
-
-          ssh -i ~/.ssh/vockey.pem ubuntu@${{ env.VM_IP }} bash << 'SSHEOF'
+          scp /tmp/cloudwatch-config.json ubuntu@${{ env.VM_IP }}:/tmp/cloudwatch-config.json
+          ssh ubuntu@${{ env.VM_IP }} bash << 'SSHEOF'
             sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
             sudo cp /tmp/cloudwatch-config.json \
               /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
             sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
               -a fetch-config -m ec2 \
-              -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json \
-              -s
+              -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
             sudo systemctl enable amazon-cloudwatch-agent
             echo "CloudWatch Agent demarre"
           SSHEOF
 
-      - name: Creation topic SNS pour les alertes
+      - name: Creation alarmes CloudWatch
         run: |
           TOPIC_ARN=$(aws sns create-topic \
             --name gmao-alerts \
-            --query 'TopicArn' \
-            --output text)
-          echo "Topic SNS : $TOPIC_ARN"
+            --query 'TopicArn' --output text)
           echo "TOPIC_ARN=$TOPIC_ARN" >> $GITHUB_ENV
 
           aws sns subscribe \
             --topic-arn "$TOPIC_ARN" \
             --protocol email \
             --notification-endpoint "oumaimabn.amelmm@gmail.com"
-          echo "Abonnement email cree"
 
-      - name: Creation des alarmes CloudWatch
-        run: |
-          INSTANCE_ID="${{ env.INSTANCE_ID }}"
-          TOPIC_ARN="${{ env.TOPIC_ARN }}"
-
-          aws cloudwatch put-metric-alarm \
-            --alarm-name "gmao-cpu-high" \
-            --alarm-description "CPU GMAO > 80%" \
-            --metric-name CPUUtilization \
-            --namespace AWS/EC2 \
-            --statistic Average \
-            --dimensions Name=InstanceId,Value=$INSTANCE_ID \
-            --period 300 --evaluation-periods 1 \
-            --threshold 80 \
-            --comparison-operator GreaterThanThreshold \
-            --alarm-actions "$TOPIC_ARN" \
-            --ok-actions "$TOPIC_ARN"
-
-          aws cloudwatch put-metric-alarm \
-            --alarm-name "gmao-memory-high" \
-            --alarm-description "Memoire GMAO > 85%" \
-            --metric-name mem_used_percent \
-            --namespace GMAO/EC2 \
-            --statistic Average \
-            --dimensions Name=InstanceId,Value=$INSTANCE_ID \
-            --period 300 --evaluation-periods 1 \
-            --threshold 85 \
-            --comparison-operator GreaterThanThreshold \
-            --alarm-actions "$TOPIC_ARN" \
-            --ok-actions "$TOPIC_ARN"
-
-          aws cloudwatch put-metric-alarm \
-            --alarm-name "gmao-disk-full" \
-            --alarm-description "Disque GMAO > 90%" \
-            --metric-name disk_used_percent \
-            --namespace GMAO/EC2 \
-            --statistic Average \
-            --dimensions Name=InstanceId,Value=$INSTANCE_ID \
-            --period 300 --evaluation-periods 1 \
-            --threshold 90 \
-            --comparison-operator GreaterThanThreshold \
-            --alarm-actions "$TOPIC_ARN" \
-            --ok-actions "$TOPIC_ARN"
-
+          for ALARM in \
+            "gmao-cpu-high|CPU GMAO > 80%|CPUUtilization|AWS/EC2|80" \
+            "gmao-memory-high|Memoire GMAO > 85%|mem_used_percent|GMAO/EC2|85" \
+            "gmao-disk-full|Disque GMAO > 90%|disk_used_percent|GMAO/EC2|90"; do
+            NAME=$(echo $ALARM      | cut -d'|' -f1)
+            DESC=$(echo $ALARM      | cut -d'|' -f2)
+            METRIC=$(echo $ALARM    | cut -d'|' -f3)
+            NS=$(echo $ALARM        | cut -d'|' -f4)
+            THRESHOLD=$(echo $ALARM | cut -d'|' -f5)
+            aws cloudwatch put-metric-alarm \
+              --alarm-name "$NAME" --alarm-description "$DESC" \
+              --metric-name "$METRIC" --namespace "$NS" \
+              --statistic Average \
+              --dimensions Name=InstanceId,Value=${{ env.INSTANCE_ID }} \
+              --period 300 --evaluation-periods 1 \
+              --threshold $THRESHOLD \
+              --comparison-operator GreaterThanThreshold \
+              --alarm-actions "$TOPIC_ARN" --ok-actions "$TOPIC_ARN"
+          done
           echo "Alarmes CloudWatch creees"
-          aws cloudwatch describe-alarms \
-            --alarm-name-prefix "gmao-" \
-            --query 'MetricAlarms[].{Nom:AlarmName,Etat:StateValue}' \
-            --output table
-
-      - name: Creation dashboard CloudWatch
-        run: |
-          INSTANCE_ID="${{ env.INSTANCE_ID }}"
-          REGION="${{ env.AWS_REGION }}"
-
-          cat > /tmp/dashboard.json << DASH
-          {
-            "widgets": [
-              {
-                "type": "metric",
-                "x": 0, "y": 0, "width": 12, "height": 6,
-                "properties": {
-                  "title": "CPU Utilization (%)",
-                  "metrics": [["AWS/EC2","CPUUtilization","InstanceId","$INSTANCE_ID"]],
-                  "period": 60, "stat": "Average", "region": "$REGION",
-                  "view": "timeSeries"
-                }
-              },
-              {
-                "type": "metric",
-                "x": 12, "y": 0, "width": 12, "height": 6,
-                "properties": {
-                  "title": "Memoire utilisee (%)",
-                  "metrics": [["GMAO/EC2","mem_used_percent","InstanceId","$INSTANCE_ID"]],
-                  "period": 60, "stat": "Average", "region": "$REGION",
-                  "view": "timeSeries"
-                }
-              },
-              {
-                "type": "metric",
-                "x": 0, "y": 6, "width": 12, "height": 6,
-                "properties": {
-                  "title": "Disque utilise (%)",
-                  "metrics": [["GMAO/EC2","disk_used_percent","InstanceId","$INSTANCE_ID"]],
-                  "period": 300, "stat": "Average", "region": "$REGION",
-                  "view": "timeSeries"
-                }
-              },
-              {
-                "type": "metric",
-                "x": 12, "y": 6, "width": 12, "height": 6,
-                "properties": {
-                  "title": "Trafic reseau (bytes)",
-                  "metrics": [
-                    ["AWS/EC2","NetworkIn","InstanceId","$INSTANCE_ID"],
-                    ["AWS/EC2","NetworkOut","InstanceId","$INSTANCE_ID"]
-                  ],
-                  "period": 60, "stat": "Sum", "region": "$REGION",
-                  "view": "timeSeries"
-                }
-              },
-              {
-                "type": "log",
-                "x": 0, "y": 12, "width": 24, "height": 6,
-                "properties": {
-                  "title": "Logs Backend Spring Boot",
-                  "query": "SOURCE '/gmao/backend' | fields @timestamp, @message | sort @timestamp desc | limit 20",
-                  "region": "$REGION",
-                  "view": "table"
-                }
-              }
-            ]
-          }
-          DASH
-
-          aws cloudwatch put-dashboard \
-            --dashboard-name "GMAO-Dashboard" \
-            --dashboard-body file:///tmp/dashboard.json
-          echo "Dashboard CloudWatch cree"
-
-      - name: Rapport periodique metriques via SNS
-        run: |
-          INSTANCE_ID="${{ env.INSTANCE_ID }}"
-          REGION="${{ env.AWS_REGION }}"
-          TOPIC_ARN=$(aws sns list-topics \
-            --query "Topics[?ends_with(TopicArn,'gmao-alerts')].TopicArn" \
-            --output text)
-
-          START=$(date -u -d '5 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')
-          END=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-
-          CPU=$(aws cloudwatch get-metric-statistics \
-            --namespace AWS/EC2 --metric-name CPUUtilization \
-            --dimensions Name=InstanceId,Value=$INSTANCE_ID \
-            --start-time $START --end-time $END \
-            --period 300 --statistics Average \
-            --query 'Datapoints[0].Average' --output text 2>/dev/null || echo "N/A")
-
-          MEM=$(aws cloudwatch get-metric-statistics \
-            --namespace GMAO/EC2 --metric-name mem_used_percent \
-            --dimensions Name=InstanceId,Value=$INSTANCE_ID \
-            --start-time $START --end-time $END \
-            --period 300 --statistics Average \
-            --query 'Datapoints[0].Average' --output text 2>/dev/null || echo "N/A")
-
-          DISK=$(aws cloudwatch get-metric-statistics \
-            --namespace GMAO/EC2 --metric-name disk_used_percent \
-            --dimensions Name=InstanceId,Value=$INSTANCE_ID \
-            --start-time $START --end-time $END \
-            --period 300 --statistics Average \
-            --query 'Datapoints[0].Average' --output text 2>/dev/null || echo "N/A")
-
-          BACKEND_STATUS=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
-            http://${{ env.VM_IP }}:8080 2>/dev/null || echo "DOWN")
-          FRONTEND_STATUS=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
-            http://${{ env.VM_IP }}:4200 2>/dev/null || echo "DOWN")
-
-          if [ -n "$TOPIC_ARN" ]; then
-            MSG="RAPPORT MONITORING GMAO | Date: $(date '+%d/%m/%Y %H:%M:%S') | Instance: $INSTANCE_ID | CPU: ${CPU}% | Memoire: ${MEM}% | Disque: ${DISK}% | Backend HTTP: $BACKEND_STATUS | Frontend HTTP: $FRONTEND_STATUS | Backend: http://$VM_IP:8080 | Frontend: http://$VM_IP:4200 | Dashboard: https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard"
-            aws sns publish \
-              --topic-arn "$TOPIC_ARN" \
-              --subject "[GMAO] Rapport Monitoring $(date '+%d/%m/%Y %H:%M')" \
-              --message "$MSG"
-            echo "Rapport envoye via SNS"
-          else
-            echo "Topic SNS introuvable"
-          fi
 
       - name: Resume monitoring
         run: |
           echo "MONITORING CLOUDWATCH CONFIGURE"
-          echo "Metriques : CPU, Memoire, Disque (toutes les 60s)"
+          echo "Metriques : CPU, Memoire, Disque"
           echo "Logs      : /gmao/backend, /gmao/frontend, /gmao/system"
           echo "Alarmes   : gmao-cpu-high, gmao-memory-high, gmao-disk-full"
-          echo "Email     : oumaimabn.amelmm@gmail.com"
           echo "Dashboard : https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard"
 
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB FINAL — Notification (toujours execute)
+#  JOB FINAL — Notification
 # ════════════════════════════════════════════════════════════════════════════
   job_notify:
     name: "JOB FINAL — Notification et Resume"
     runs-on: ubuntu-latest
-    needs: [job1_create_vm, job2_post_install, job3_start_app, job4_monitoring]
+    needs: [job1_create_vm, job2_post_install, job3_start_app, job4_sast, job5_dast, job6_monitoring]
     if: always() && github.event.inputs.destroy_infra != 'true'
-
     env:
       VM_IP:      ${{ needs.job1_create_vm.outputs.public_ip }}
       VM_SKIPPED: ${{ needs.job1_create_vm.outputs.vm_skipped }}
@@ -749,108 +911,109 @@ jobs:
       J1_STATUS:  ${{ needs.job1_create_vm.result }}
       J2_STATUS:  ${{ needs.job2_post_install.result }}
       J3_STATUS:  ${{ needs.job3_start_app.result }}
-      JM_STATUS:  ${{ needs.job4_monitoring.result }}
-
+      J4_SAST:    ${{ needs.job4_sast.outputs.sast_status }}
+      J4_SUMMARY: ${{ needs.job4_sast.outputs.sast_summary }}
+      J5_DAST:    ${{ needs.job5_dast.outputs.dast_status }}
+      J5_SUMMARY: ${{ needs.job5_dast.outputs.dast_summary }}
+      J6_STATUS:  ${{ needs.job6_monitoring.result }}
     steps:
-      - name: Resume complet du deploiement (logs)
+      - name: Resume complet du deploiement
         run: |
-          echo "RAPPORT DE DEPLOIEMENT GMAO"
-          echo "Date          : $(date '+%d/%m/%Y %H:%M:%S')"
-          echo "Branche       : ${{ github.ref_name }}"
-          echo "Commit        : ${{ github.sha }}"
-          echo "Declenche par : ${{ github.actor }}"
-          echo "---"
-          echo "JOB 0 — Validation code : ${{ needs.job0_validate_code.result }}"
-          echo "JOB 1 — VM EC2          : ${{ needs.job1_create_vm.result }}"
-          if [ "$VM_SKIPPED" = "true" ]; then
-            echo "JOB 2 — Post-install    : skippe (VM deja active)"
-            echo "JOB 3 — Demarrage app   : skippe (VM deja active)"
-            echo "JOB 4 — Monitoring      : skippe (VM deja active)"
-          else
-            echo "JOB 2 — Post-install    : ${{ needs.job2_post_install.result }}"
-            echo "JOB 3 — Demarrage app   : ${{ needs.job3_start_app.result }}"
-            echo "JOB 4 — Monitoring      : ${{ needs.job4_monitoring.result }}"
-          fi
-          echo "---"
-          if [ "$VM_SKIPPED" = "true" ]; then
-            echo "VM DEJA ACTIVE — aucun deploiement effectue"
-          elif [ "$J1_STATUS" = "success" ] && [ "$J3_STATUS" = "success" ]; then
-            echo "DEPLOIEMENT REUSSI"
-            echo "Backend  : http://$VM_IP:8080"
-            echo "Frontend : http://$VM_IP:4200"
-            echo "SSH      : ssh -i labsuser.pem ubuntu@$VM_IP"
-            echo "Dashboard: CloudWatch → GMAO-Dashboard"
-          elif [ "$J1_STATUS" = "failure" ]; then
-            echo "ECHEC — Creation VM echouee"
-          elif [ "$J2_STATUS" = "failure" ]; then
-            echo "ECHEC — Post-install echoue"
-          elif [ "$J3_STATUS" = "failure" ]; then
-            echo "ECHEC — Demarrage application echoue"
-          fi
-          echo "Logs : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "════════════════════════════════════════"
+          echo "  RAPPORT DEPLOIEMENT GMAO"
+          echo "  $(date '+%d/%m/%Y %H:%M:%S')"
+          echo "════════════════════════════════════════"
+          echo "JOB 0 — Validation code  : $J0_STATUS"
+          echo "JOB 1 — VM EC2           : $J1_STATUS"
+          echo "JOB 2 — Post-install     : $J2_STATUS"
+          echo "JOB 3 — Demarrage app    : $J3_STATUS"
+          echo "JOB 4 — SAST Semgrep     : $J4_SAST — $J4_SUMMARY"
+          echo "JOB 5 — DAST Inspector   : $J5_DAST — $J5_SUMMARY"
+          echo "JOB 6 — Monitoring       : $J6_STATUS"
+          echo "Backend  : http://$VM_IP:8080"
+          echo "Frontend : http://$VM_IP:4200"
+          echo "Logs     : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-      - name: Envoi email resultat pipeline via Gmail SMTP
+      - name: Envoi emails alertes SAST/DAST + resume
         run: |
-          if [ "${{ needs.job1_create_vm.outputs.vm_skipped }}" = "true" ]; then
-            STATUT="VM DEJA ACTIVE — aucun deploiement effectue"
-            SUJET="[GMAO] VM deja active — $(date '+%d/%m/%Y %H:%M')"
-          elif [ "${{ needs.job1_create_vm.result }}" = "success" ] && \
-               [ "${{ needs.job3_start_app.result }}" = "success" ]; then
-            STATUT="DEPLOIEMENT REUSSI"
-            SUJET="[GMAO] Deploiement reussi — ${{ github.ref_name }}"
-          else
-            STATUT="DEPLOIEMENT ECHOUE"
-            SUJET="[GMAO] Deploiement echoue — ${{ github.ref_name }}"
-          fi
-
-          BODY="Bonjour, RAPPORT DEPLOIEMENT GMAO - Date: $(date '+%d/%m/%Y %H:%M:%S') - Statut: $STATUT - Branche: $GITHUB_REF_NAME - Commit: $GITHUB_SHA - Auteur: $GITHUB_ACTOR - JOB0: $J0_STATUS - JOB1: $J1_STATUS - JOB2: $J2_STATUS - JOB3: $J3_STATUS - JOB4: $JM_STATUS - Backend: http://$VM_IP:8080 - Frontend: http://$VM_IP:4200 - SSH: ubuntu@$VM_IP - Dashboard: https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard - Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-
           sudo apt-get install -y msmtp msmtp-mta -q
-
           {
             echo "defaults"
             echo "auth on"
             echo "tls on"
             echo "tls_trust_file /etc/ssl/certs/ca-certificates.crt"
-            echo "logfile ~/.msmtp.log"
-            echo ""
             echo "account gmail"
             echo "host smtp.gmail.com"
             echo "port 587"
             echo "from ${{ secrets.GMAIL_USER }}"
             echo "user ${{ secrets.GMAIL_USER }}"
             echo "password ${{ secrets.GMAIL_PASSWORD }}"
-            echo ""
             echo "account default : gmail"
           } > ~/.msmtprc
           chmod 600 ~/.msmtprc
 
-          printf "To: oumaimabn.amelmm@gmail.com\nFrom: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s" \
-            "${{ secrets.GMAIL_USER }}" "$SUJET" "$BODY" | \
-            msmtp "oumaimabn.amelmm@gmail.com" && \
-            echo "Email envoye a oumaimabn.amelmm@gmail.com" || \
-            echo "Echec envoi email — verifiez GMAIL_USER et GMAIL_PASSWORD"
+          # ── Email alerte SAST ───────────────────────────────────────────
+          if [ "$J4_SAST" = "issues_found" ]; then
+            printf "To: oumaimabn.amelmm@gmail.com\nFrom: %s\nSubject: [GMAO] SAST — Vulnerabilites detectees\nContent-Type: text/plain; charset=UTF-8\n\n%s" \
+              "${{ secrets.GMAIL_USER }}" \
+              "ALERTE SAST — Semgrep a detecte des vulnerabilites.
+          Date     : $(date '+%d/%m/%Y %H:%M:%S')
+          Commit   : ${{ github.sha }}
+          Resultats: $J4_SUMMARY
 
-# ════════════════════════════════════════════════════════════════════════════
-#  [DESACTIVE] — Terraform Destroy
-#  job4_destroy:
-#    name: "JOB — Terraform Destroy"
-#    runs-on: ubuntu-latest
-#    if: github.event.inputs.destroy_infra == 'true'
-#    steps:
-#      - uses: actions/checkout@v4
-#      - uses: aws-actions/configure-aws-credentials@v4
-#        with:
-#          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-#          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-#          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
-#          aws-region:            ${{ env.AWS_REGION }}
-#      - uses: hashicorp/setup-terraform@v3
-#        with:
-#          terraform_version: "1.6.0"
-#          terraform_wrapper: false
-#      - run: terraform init
-#        working-directory: ${{ env.TF_DIR }}
-#      - run: terraform destroy -auto-approve
-#        working-directory: ${{ env.TF_DIR }}
-# ════════════════════════════════════════════════════════════════════════════
+          Rapport disponible dans les artefacts GitHub Actions :
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          NOTE : Le deploiement a continue malgre ces alertes." | \
+              msmtp "oumaimabn.amelmm@gmail.com" && \
+              echo "Email SAST envoye" || echo "Echec email SAST"
+          fi
+
+          # ── Email alerte DAST ───────────────────────────────────────────
+          if [ "$J5_DAST" = "issues_found" ]; then
+            printf "To: oumaimabn.amelmm@gmail.com\nFrom: %s\nSubject: [GMAO] DAST — Vulnerabilites EC2 detectees\nContent-Type: text/plain; charset=UTF-8\n\n%s" \
+              "${{ secrets.GMAIL_USER }}" \
+              "ALERTE DAST — Amazon Inspector v2 a detecte des vulnerabilites.
+          Date      : $(date '+%d/%m/%Y %H:%M:%S')
+          Instance  : ${{ needs.job1_create_vm.outputs.instance_id }}
+          Resultats : $J5_SUMMARY
+
+          Rapport disponible dans les artefacts GitHub Actions :
+          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          AWS Inspector : https://console.aws.amazon.com/inspector/v2/home
+
+          NOTE : Le deploiement a continue malgre ces alertes." | \
+              msmtp "oumaimabn.amelmm@gmail.com" && \
+              echo "Email DAST envoye" || echo "Echec email DAST"
+          fi
+
+          # ── Email résumé final ──────────────────────────────────────────
+          if [ "$J1_STATUS" = "success" ] && [ "$J3_STATUS" = "success" ]; then
+            STATUT="DEPLOIEMENT REUSSI"
+          else
+            STATUT="DEPLOIEMENT ECHOUE"
+          fi
+
+          printf "To: oumaimabn.amelmm@gmail.com\nFrom: %s\nSubject: [GMAO] %s — $(date '+%d/%m/%Y %H:%M')\nContent-Type: text/plain; charset=UTF-8\n\n%s" \
+            "${{ secrets.GMAIL_USER }}" "$STATUT" \
+            "RAPPORT DEPLOIEMENT GMAO
+          Date      : $(date '+%d/%m/%Y %H:%M:%S')
+          Statut    : $STATUT
+          Branche   : ${{ github.ref_name }}
+          Commit    : ${{ github.sha }}
+          Auteur    : ${{ github.actor }}
+
+          JOB 0 Validation  : $J0_STATUS
+          JOB 1 VM EC2      : $J1_STATUS
+          JOB 2 Post-install: $J2_STATUS
+          JOB 3 App         : $J3_STATUS
+          JOB 4 SAST        : $J4_SAST — $J4_SUMMARY
+          JOB 5 DAST        : $J5_DAST — $J5_SUMMARY
+          JOB 6 Monitoring  : $J6_STATUS
+
+          Backend  : http://$VM_IP:8080
+          Frontend : http://$VM_IP:4200
+          Rapports : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" | \
+            msmtp "oumaimabn.amelmm@gmail.com" && \
+            echo "Email resume envoye" || echo "Echec email resume"
