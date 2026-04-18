@@ -404,7 +404,7 @@ jobs:
           exit 1
 
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB 4 — SAST : Semgrep (action officielle) + Trivy SCA
+#  JOB 4 — SAST : Semgrep + Trivy SCA + blocage critique + faux positifs
 # ════════════════════════════════════════════════════════════════════════════
   job4_sast:
     name: "JOB 4 — SAST Semgrep + Trivy SCA"
@@ -413,132 +413,241 @@ jobs:
     if: ${{ github.event.inputs.destroy_infra != 'true' }}
     continue-on-error: true
     outputs:
-      sast_status:  ${{ steps.sast_result.outputs.sast_status }}
-      sast_summary: ${{ steps.sast_result.outputs.sast_summary }}
+      sast_status:   ${{ steps.sast_result.outputs.sast_status }}
+      sast_summary:  ${{ steps.sast_result.outputs.sast_summary }}
+      sast_blocking: ${{ steps.sast_result.outputs.sast_blocking }}
     steps:
       - name: Checkout du depot
         uses: actions/checkout@v4
 
-      # ── Semgrep via action officielle (sans Docker) ─────────────────────
+      # ── Fichier .semgrepignore auto si absent ───────────────────────────
+      - name: Creation .semgrepignore si absent
+        run: |
+          if [ ! -f ".semgrepignore" ]; then
+            cat > .semgrepignore << 'EOF'
+          # Ignorer les fichiers de test (faux positifs fréquents)
+          **/test/**
+          **/tests/**
+          **/*Test.java
+          **/*Spec.ts
+          # Ignorer les fichiers générés
+          **/target/**
+          **/node_modules/**
+          **/dist/**
+          **/build/**
+          EOF
+            echo "Fichier .semgrepignore créé automatiquement"
+          else
+            echo "Fichier .semgrepignore existant conservé"
+          fi
+
+      # ── Semgrep Backend Java ────────────────────────────────────────────
       - name: SAST — Semgrep Backend Java
         id: semgrep_backend
-        uses: semgrep/semgrep-action@v1
         continue-on-error: true
-        with:
-          config: >
-            p/java
-            p/owasp-top-ten
-            p/secrets
-          output-format: json
-          output-file: semgrep-backend.json
-        env:
-          SEMGREP_RULES_DIR: gmao-backend
-
-      - name: SAST — Semgrep Frontend TypeScript
-        id: semgrep_frontend
-        uses: semgrep/semgrep-action@v1
-        continue-on-error: true
-        with:
-          config: >
-            p/typescript
-            p/owasp-top-ten
-            p/secrets
-          output-format: json
-          output-file: semgrep-frontend.json
-        env:
-          SEMGREP_RULES_DIR: gmao-frontend
-
-      # ── Trivy SCA : vulnérabilités dans les dépendances ────────────────
-      - name: SCA — Trivy (dépendances Maven pom.xml)
-        id: trivy_backend
-        uses: aquasecurity/trivy-action@master
-        continue-on-error: true
-        with:
-          scan-type: fs
-          scan-ref: gmao-backend
-          format: json
-          output: trivy-backend.json
-          severity: CRITICAL,HIGH
-          exit-code: '0'
-
-      - name: SCA — Trivy (dépendances npm package.json)
-        id: trivy_frontend
-        uses: aquasecurity/trivy-action@master
-        continue-on-error: true
-        with:
-          scan-type: fs
-          scan-ref: gmao-frontend
-          format: json
-          output: trivy-frontend.json
-          severity: CRITICAL,HIGH
-          exit-code: '0'
-
-      # ── Comptage et rapport ─────────────────────────────────────────────
-      - name: Comptage des findings
-        id: count_findings
         run: |
+          pip install semgrep --break-system-packages -q
           mkdir -p /tmp/sast-reports
-          cp semgrep-backend.json  /tmp/sast-reports/ 2>/dev/null || echo "{}" > /tmp/sast-reports/semgrep-backend.json
-          cp semgrep-frontend.json /tmp/sast-reports/ 2>/dev/null || echo "{}" > /tmp/sast-reports/semgrep-frontend.json
-          cp trivy-backend.json    /tmp/sast-reports/ 2>/dev/null || echo "{}" > /tmp/sast-reports/trivy-backend.json
-          cp trivy-frontend.json   /tmp/sast-reports/ 2>/dev/null || echo "{}" > /tmp/sast-reports/trivy-frontend.json
 
-          SEMGREP_BACKEND=$(python3 -c "
-          import json,sys
+          semgrep scan \
+            --config "p/java" \
+            --config "p/owasp-top-ten" \
+            --config "p/secrets" \
+            --json \
+            --output /tmp/sast-reports/semgrep-backend.json \
+            gmao-backend/ 2>/dev/null || true
+
+          COUNT=$(python3 -c "
+          import json
           try:
             data=json.load(open('/tmp/sast-reports/semgrep-backend.json'))
             print(len(data.get('results',[])))
           except: print(0)" 2>/dev/null || echo "0")
 
-          SEMGREP_FRONTEND=$(python3 -c "
-          import json,sys
+          CRITICAL=$(python3 -c "
+          import json
+          try:
+            data=json.load(open('/tmp/sast-reports/semgrep-backend.json'))
+            print(sum(1 for r in data.get('results',[])
+              if r.get('extra',{}).get('severity','') == 'ERROR'))
+          except: print(0)" 2>/dev/null || echo "0")
+
+          echo "semgrep_backend_total=$COUNT"       >> $GITHUB_OUTPUT
+          echo "semgrep_backend_critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "Semgrep Backend : $COUNT finding(s) dont $CRITICAL critique(s)"
+
+      # ── Semgrep Frontend TypeScript ─────────────────────────────────────
+      - name: SAST — Semgrep Frontend TypeScript
+        id: semgrep_frontend
+        continue-on-error: true
+        run: |
+          semgrep scan \
+            --config "p/typescript" \
+            --config "p/owasp-top-ten" \
+            --config "p/secrets" \
+            --json \
+            --output /tmp/sast-reports/semgrep-frontend.json \
+            gmao-frontend/ 2>/dev/null || true
+
+          COUNT=$(python3 -c "
+          import json
           try:
             data=json.load(open('/tmp/sast-reports/semgrep-frontend.json'))
             print(len(data.get('results',[])))
           except: print(0)" 2>/dev/null || echo "0")
 
-          TRIVY_BACKEND=$(python3 -c "
-          import json,sys
+          CRITICAL=$(python3 -c "
+          import json
+          try:
+            data=json.load(open('/tmp/sast-reports/semgrep-frontend.json'))
+            print(sum(1 for r in data.get('results',[])
+              if r.get('extra',{}).get('severity','') == 'ERROR'))
+          except: print(0)" 2>/dev/null || echo "0")
+
+          echo "semgrep_frontend_total=$COUNT"       >> $GITHUB_OUTPUT
+          echo "semgrep_frontend_critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "Semgrep Frontend : $COUNT finding(s) dont $CRITICAL critique(s)"
+
+      # ── SpotBugs Backend Java (analyse bytecode) ────────────────────────
+      - name: SAST — SpotBugs Backend Java
+        id: spotbugs
+        continue-on-error: true
+        run: |
+          echo "Compilation du backend pour SpotBugs..."
+          cd gmao-backend
+
+          # Ajout du plugin SpotBugs dans le build Maven temporaire
+          mvn compile spotbugs:spotbugs \
+            -Dplugin.version=4.8.3 \
+            --no-transfer-progress -q 2>/dev/null || true
+
+          # Récupération du rapport XML SpotBugs
+          if [ -f "target/spotbugsXml.xml" ]; then
+            cp target/spotbugsXml.xml /tmp/sast-reports/spotbugs.xml
+            COUNT=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          try:
+            tree=ET.parse('/tmp/sast-reports/spotbugs.xml')
+            print(len(tree.findall('.//BugInstance')))
+          except: print(0)")
+            echo "SpotBugs : $COUNT bug(s) détecté(s)"
+            echo "spotbugs_count=$COUNT" >> $GITHUB_OUTPUT
+          else
+            echo "SpotBugs : rapport non généré (ignoré)"
+            echo "spotbugs_count=0" >> $GITHUB_OUTPUT
+            echo "{}" > /tmp/sast-reports/spotbugs.xml
+          fi
+
+      # ── Trivy Backend — BLOQUE si CVE CRITICAL avec fix dispo ──────────
+      - name: SCA — Trivy Backend Maven (bloquant si CRITICAL)
+        id: trivy_backend
+        continue-on-error: true
+        run: |
+          # Installation Trivy
+          wget -qO- https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin 2>/dev/null
+
+          # Scan avec sortie JSON complète
+          trivy fs gmao-backend \
+            --format json \
+            --output /tmp/sast-reports/trivy-backend.json \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --quiet 2>/dev/null || true
+
+          # Comptage CVE critiques (avec fix disponible)
+          CRITICAL=$(python3 -c "
+          import json
           try:
             data=json.load(open('/tmp/sast-reports/trivy-backend.json'))
-            vulns=[v for r in data.get('Results',[]) for v in r.get('Vulnerabilities') or []]
+            vulns=[v for r in data.get('Results',[])
+                     for v in (r.get('Vulnerabilities') or [])
+                     if v.get('Severity')=='CRITICAL']
             print(len(vulns))
           except: print(0)" 2>/dev/null || echo "0")
 
-          TRIVY_FRONTEND=$(python3 -c "
-          import json,sys
+          HIGH=$(python3 -c "
+          import json
+          try:
+            data=json.load(open('/tmp/sast-reports/trivy-backend.json'))
+            vulns=[v for r in data.get('Results',[])
+                     for v in (r.get('Vulnerabilities') or [])
+                     if v.get('Severity')=='HIGH']
+            print(len(vulns))
+          except: print(0)" 2>/dev/null || echo "0")
+
+          echo "trivy_backend_critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "trivy_backend_high=$HIGH"         >> $GITHUB_OUTPUT
+          echo "Trivy Backend : $CRITICAL CRITICAL + $HIGH HIGH"
+
+          # Blocage si CVE critique avec fix disponible
+          if [ "$CRITICAL" -gt 0 ]; then
+            echo "BLOQUANT : $CRITICAL CVE critique(s) avec fix disponible détectée(s)"
+            echo "trivy_backend_blocking=true" >> $GITHUB_OUTPUT
+          else
+            echo "trivy_backend_blocking=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Trivy Frontend — BLOQUE si CVE CRITICAL avec fix dispo ─────────
+      - name: SCA — Trivy Frontend npm (bloquant si CRITICAL)
+        id: trivy_frontend
+        continue-on-error: true
+        run: |
+          trivy fs gmao-frontend \
+            --format json \
+            --output /tmp/sast-reports/trivy-frontend.json \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --quiet 2>/dev/null || true
+
+          CRITICAL=$(python3 -c "
+          import json
           try:
             data=json.load(open('/tmp/sast-reports/trivy-frontend.json'))
-            vulns=[v for r in data.get('Results',[]) for v in r.get('Vulnerabilities') or []]
+            vulns=[v for r in data.get('Results',[])
+                     for v in (r.get('Vulnerabilities') or [])
+                     if v.get('Severity')=='CRITICAL']
             print(len(vulns))
           except: print(0)" 2>/dev/null || echo "0")
 
-          echo "semgrep_backend=$SEMGREP_BACKEND"   >> $GITHUB_OUTPUT
-          echo "semgrep_frontend=$SEMGREP_FRONTEND" >> $GITHUB_OUTPUT
-          echo "trivy_backend=$TRIVY_BACKEND"       >> $GITHUB_OUTPUT
-          echo "trivy_frontend=$TRIVY_FRONTEND"     >> $GITHUB_OUTPUT
+          HIGH=$(python3 -c "
+          import json
+          try:
+            data=json.load(open('/tmp/sast-reports/trivy-frontend.json'))
+            vulns=[v for r in data.get('Results',[])
+                     for v in (r.get('Vulnerabilities') or [])
+                     if v.get('Severity')=='HIGH']
+            print(len(vulns))
+          except: print(0)" 2>/dev/null || echo "0")
 
-          echo "Semgrep Backend  : $SEMGREP_BACKEND finding(s)"
-          echo "Semgrep Frontend : $SEMGREP_FRONTEND finding(s)"
-          echo "Trivy Backend    : $TRIVY_BACKEND CVE(s)"
-          echo "Trivy Frontend   : $TRIVY_FRONTEND CVE(s)"
+          echo "trivy_frontend_critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "trivy_frontend_high=$HIGH"         >> $GITHUB_OUTPUT
+          echo "Trivy Frontend : $CRITICAL CRITICAL + $HIGH HIGH"
 
-      # ── Génération rapport HTML ─────────────────────────────────────────
-      - name: Generation rapport SAST HTML
+          if [ "$CRITICAL" -gt 0 ]; then
+            echo "BLOQUANT : $CRITICAL CVE critique(s) avec fix disponible"
+            echo "trivy_frontend_blocking=true" >> $GITHUB_OUTPUT
+          else
+            echo "trivy_frontend_blocking=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Génération rapport HTML enrichi ────────────────────────────────
+      - name: Generation rapport SAST HTML complet
         run: |
           python3 << 'PYEOF'
-          import json
+          import json, xml.etree.ElementTree as ET
 
-          def load(path):
+          def load_json(path):
               try:
                   with open(path) as f: return json.load(f)
               except: return {}
 
-          sb  = load("/tmp/sast-reports/semgrep-backend.json")
-          sf  = load("/tmp/sast-reports/semgrep-frontend.json")
-          tb  = load("/tmp/sast-reports/trivy-backend.json")
-          tf  = load("/tmp/sast-reports/trivy-frontend.json")
+          sb  = load_json("/tmp/sast-reports/semgrep-backend.json")
+          sf  = load_json("/tmp/sast-reports/semgrep-frontend.json")
+          tb  = load_json("/tmp/sast-reports/trivy-backend.json")
+          tf  = load_json("/tmp/sast-reports/trivy-frontend.json")
 
+          # ── Semgrep rows ──
           semgrep_rows = ""
           for origin, data in [("Backend (Java)", sb), ("Frontend (TypeScript)", sf)]:
               for r in data.get("results", []):
@@ -547,72 +656,157 @@ jobs:
                   path  = r.get("path", "")
                   line  = r.get("start", {}).get("line", "")
                   rule  = r.get("check_id", "")
-                  color = "#ff4444" if sev == "ERROR" else "#ff9900" if sev == "WARNING" else "#888"
-                  semgrep_rows += f"<tr><td style='color:{color}'><b>{sev}</b></td><td>{origin}</td><td>{path}</td><td>{line}</td><td>{rule}</td><td>{msg}</td></tr>"
+                  color = "#ff4444" if sev=="ERROR" else "#ff9900" if sev=="WARNING" else "#888"
+                  badge = "CRITIQUE" if sev=="ERROR" else "ATTENTION" if sev=="WARNING" else "INFO"
+                  semgrep_rows += (
+                    f"<tr><td><span style='background:{color};color:white;"
+                    f"padding:2px 6px;border-radius:4px;font-size:11px'>{badge}</span></td>"
+                    f"<td>{origin}</td><td>{path}:{line}</td>"
+                    f"<td>{rule.split('.')[-1]}</td><td>{msg}</td></tr>"
+                  )
 
+          # ── Trivy rows ──
           trivy_rows = ""
           for origin, data in [("Backend (Maven)", tb), ("Frontend (npm)", tf)]:
               for result in data.get("Results", []):
                   for v in result.get("Vulnerabilities") or []:
-                      sev   = v.get("Severity", "UNKNOWN")
-                      cve   = v.get("VulnerabilityID", "")
-                      pkg   = v.get("PkgName", "")
-                      ver   = v.get("InstalledVersion", "")
-                      fixed = v.get("FixedVersion", "—")
-                      title = (v.get("Title", "") or "")[:100]
-                      color = "#ff4444" if sev == "CRITICAL" else "#ff9900" if sev == "HIGH" else "#888"
-                      trivy_rows += f"<tr><td style='color:{color}'><b>{sev}</b></td><td>{origin}</td><td>{cve}</td><td>{pkg}</td><td>{ver}</td><td>{fixed}</td><td>{title}</td></tr>"
+                      sev   = v.get("Severity","UNKNOWN")
+                      cve   = v.get("VulnerabilityID","")
+                      pkg   = v.get("PkgName","")
+                      ver   = v.get("InstalledVersion","")
+                      fixed = v.get("FixedVersion","—")
+                      title = (v.get("Title","") or "")[:100]
+                      color = "#ff4444" if sev=="CRITICAL" else "#ff9900"
+                      trivy_rows += (
+                        f"<tr><td><span style='background:{color};color:white;"
+                        f"padding:2px 6px;border-radius:4px;font-size:11px'>{sev}</span></td>"
+                        f"<td>{origin}</td><td><b>{cve}</b></td>"
+                        f"<td>{pkg} {ver}</td>"
+                        f"<td style='color:green'>{fixed}</td><td>{title}</td></tr>"
+                      )
 
-          total_semgrep = len(sb.get("results",[])) + len(sf.get("results",[]))
-          total_trivy   = sum(len(r.get("Vulnerabilities") or []) for d in [tb,tf] for r in d.get("Results",[]))
+          # ── SpotBugs rows ──
+          spotbugs_rows = ""
+          try:
+              tree = ET.parse("/tmp/sast-reports/spotbugs.xml")
+              for bug in tree.findall(".//BugInstance"):
+                  cat  = bug.get("category","")
+                  prio = bug.get("priority","3")
+                  typ  = bug.get("type","")
+                  cls  = (bug.find("Class") or bug).get("classname","")
+                  color = "#ff4444" if prio=="1" else "#ff9900" if prio=="2" else "#888"
+                  label = "HAUT" if prio=="1" else "MOYEN" if prio=="2" else "BAS"
+                  spotbugs_rows += (
+                    f"<tr><td><span style='background:{color};color:white;"
+                    f"padding:2px 6px;border-radius:4px;font-size:11px'>{label}</span></td>"
+                    f"<td>{cat}</td><td>{typ}</td><td>{cls}</td></tr>"
+                  )
+          except: pass
+
+          total_semgrep  = len(sb.get("results",[])) + len(sf.get("results",[]))
+          total_trivy    = sum(
+              len(r.get("Vulnerabilities") or [])
+              for d in [tb,tf] for r in d.get("Results",[])
+          )
 
           html = f"""<!DOCTYPE html>
-          <html><head><meta charset='UTF-8'><title>Rapport SAST GMAO</title>
+          <html><head><meta charset='UTF-8'>
+          <title>Rapport SAST GMAO</title>
           <style>
-            body{{font-family:Arial,sans-serif;padding:20px;background:#f5f5f5}}
-            h1,h2{{color:#232f3e}} table{{width:100%;border-collapse:collapse;background:white;margin-bottom:30px}}
-            th{{background:#232f3e;color:white;padding:10px;text-align:left}}
-            td{{padding:8px;border-bottom:1px solid #ddd;font-size:13px}}
-            .summary{{background:white;padding:15px;margin-bottom:20px;border-left:4px solid #ff9900}}
-            .badge{{display:inline-block;padding:2px 8px;border-radius:4px;color:white;font-size:12px}}
+            body{{font-family:Arial,sans-serif;padding:24px;background:#f5f5f5;color:#222}}
+            h1{{color:#232f3e;border-bottom:3px solid #ff9900;padding-bottom:8px}}
+            h2{{color:#232f3e;margin-top:32px}}
+            table{{width:100%;border-collapse:collapse;background:white;
+                   margin-bottom:24px;box-shadow:0 1px 4px rgba(0,0,0,.1)}}
+            th{{background:#232f3e;color:white;padding:10px;text-align:left;font-size:13px}}
+            td{{padding:8px 10px;border-bottom:1px solid #eee;font-size:12px;vertical-align:top}}
+            tr:hover{{background:#fafafa}}
+            .summary{{display:flex;gap:16px;margin-bottom:24px;flex-wrap:wrap}}
+            .card{{background:white;padding:16px 24px;border-radius:8px;
+                   box-shadow:0 1px 4px rgba(0,0,0,.1);min-width:160px}}
+            .card .num{{font-size:32px;font-weight:bold;color:#ff4444}}
+            .card .num.ok{{color:green}}
+            .card .lab{{font-size:12px;color:#666;margin-top:4px}}
+            .blocking{{background:#fff3f3;border-left:4px solid #ff4444;
+                       padding:12px 16px;margin-bottom:24px;border-radius:4px}}
+            .ok-banner{{background:#f3fff3;border-left:4px solid green;
+                        padding:12px 16px;margin-bottom:24px;border-radius:4px}}
           </style></head><body>
           <h1>Rapport SAST + SCA — Application GMAO</h1>
+
           <div class='summary'>
-            <b>Semgrep (analyse code) :</b> {total_semgrep} finding(s)<br>
-            <b>Trivy (dépendances)    :</b> {total_trivy} CVE(s) CRITICAL/HIGH<br>
-            <b>Total                  :</b> {total_semgrep + total_trivy}
+            <div class='card'>
+              <div class='num {"ok" if total_semgrep==0 else ""}'>{total_semgrep}</div>
+              <div class='lab'>Semgrep findings</div>
+            </div>
+            <div class='card'>
+              <div class='num {"ok" if total_trivy==0 else ""}'>{total_trivy}</div>
+              <div class='lab'>CVE Trivy (CRITICAL+HIGH)</div>
+            </div>
+            <div class='card'>
+              <div class='num {"ok" if not spotbugs_rows else ""}'>{len(spotbugs_rows)//100 if spotbugs_rows else 0}</div>
+              <div class='lab'>SpotBugs bugs</div>
+            </div>
           </div>
+
           <h2>Semgrep — Analyse du code source</h2>
-          <table><tr><th>Sévérité</th><th>Source</th><th>Fichier</th><th>Ligne</th><th>Règle</th><th>Message</th></tr>
-          {semgrep_rows or "<tr><td colspan='6' style='text-align:center;color:green'>✅ Aucun problème détecté</td></tr>"}
+          <table>
+            <tr><th>Sévérité</th><th>Source</th><th>Fichier:Ligne</th><th>Règle</th><th>Message</th></tr>
+            {semgrep_rows or "<tr><td colspan='5' style='text-align:center;padding:20px;color:green'>Aucun problème détecté</td></tr>"}
           </table>
-          <h2>Trivy — Vulnérabilités dans les dépendances</h2>
-          <table><tr><th>Sévérité</th><th>Source</th><th>CVE</th><th>Package</th><th>Version</th><th>Fix dispo</th><th>Description</th></tr>
-          {trivy_rows or "<tr><td colspan='7' style='text-align:center;color:green'>✅ Aucune CVE CRITICAL/HIGH détectée</td></tr>"}
+
+          <h2>Trivy — CVE dans les dépendances (avec fix disponible)</h2>
+          <table>
+            <tr><th>Sévérité</th><th>Source</th><th>CVE</th><th>Package</th><th>Fix disponible</th><th>Description</th></tr>
+            {trivy_rows or "<tr><td colspan='6' style='text-align:center;padding:20px;color:green'>Aucune CVE CRITICAL/HIGH détectée</td></tr>"}
+          </table>
+
+          <h2>SpotBugs — Bugs dans le bytecode Java</h2>
+          <table>
+            <tr><th>Priorité</th><th>Catégorie</th><th>Type</th><th>Classe</th></tr>
+            {spotbugs_rows or "<tr><td colspan='4' style='text-align:center;padding:20px;color:green'>Aucun bug détecté</td></tr>"}
           </table>
           </body></html>"""
 
-          with open("/tmp/sast-reports/sast-report.html", "w") as f:
+          with open("/tmp/sast-reports/sast-report.html","w") as f:
               f.write(html)
-          print("Rapport SAST+SCA HTML généré")
+          print("Rapport SAST HTML complet généré")
           PYEOF
 
+      # ── Statut final avec détection blocage ────────────────────────────
       - name: Statut final SAST
         id: sast_result
         run: |
-          SB="${{ steps.count_findings.outputs.semgrep_backend }}"
-          SF="${{ steps.count_findings.outputs.semgrep_frontend }}"
-          TB="${{ steps.count_findings.outputs.trivy_backend }}"
-          TF="${{ steps.count_findings.outputs.trivy_frontend }}"
-          TOTAL=$(( ${SB:-0} + ${SF:-0} + ${TB:-0} + ${TF:-0} ))
-          SUMMARY="Semgrep: $((${SB:-0}+${SF:-0})) finding(s) | Trivy CVE: $((${TB:-0}+${TF:-0})) | Total: $TOTAL"
+          SB_T="${{ steps.semgrep_backend.outputs.semgrep_backend_total }}"
+          SF_T="${{ steps.semgrep_frontend.outputs.semgrep_frontend_total }}"
+          TB_C="${{ steps.trivy_backend.outputs.trivy_backend_critical }}"
+          TF_C="${{ steps.trivy_frontend.outputs.trivy_frontend_critical }}"
+          TB_H="${{ steps.trivy_backend.outputs.trivy_backend_high }}"
+          TF_H="${{ steps.trivy_frontend.outputs.trivy_frontend_high }}"
+          SP="${{ steps.spotbugs.outputs.spotbugs_count }}"
+
+          TOTAL_SEMGREP=$(( ${SB_T:-0} + ${SF_T:-0} ))
+          TOTAL_CVE_C=$(( ${TB_C:-0} + ${TF_C:-0} ))
+          TOTAL_CVE_H=$(( ${TB_H:-0} + ${TF_H:-0} ))
+          BLOCKING_TB="${{ steps.trivy_backend.outputs.trivy_backend_blocking }}"
+          BLOCKING_TF="${{ steps.trivy_frontend.outputs.trivy_frontend_blocking }}"
+
+          SUMMARY="Semgrep: $TOTAL_SEMGREP | CVE Critical: $TOTAL_CVE_C | CVE High: $TOTAL_CVE_H | SpotBugs: ${SP:-0}"
           echo "sast_summary=$SUMMARY" >> $GITHUB_OUTPUT
-          if [ "$TOTAL" -gt 0 ]; then
-            echo "sast_status=issues_found" >> $GITHUB_OUTPUT
-            echo "⚠️  SAST : $TOTAL problème(s) détecté(s)"
+
+          # Statut bloquant si CVE critique avec fix dispo
+          if [ "$BLOCKING_TB" = "true" ] || [ "$BLOCKING_TF" = "true" ]; then
+            echo "sast_status=critical_blocking" >> $GITHUB_OUTPUT
+            echo "sast_blocking=true"            >> $GITHUB_OUTPUT
+            echo "BLOQUANT : CVE critique(s) détectée(s) avec correctif disponible"
+          elif [ "$TOTAL_SEMGREP" -gt 0 ] || [ "$TOTAL_CVE_H" -gt 0 ]; then
+            echo "sast_status=issues_found"  >> $GITHUB_OUTPUT
+            echo "sast_blocking=false"       >> $GITHUB_OUTPUT
+            echo "AVERTISSEMENT : problèmes détectés (non bloquants)"
           else
-            echo "sast_status=clean"        >> $GITHUB_OUTPUT
-            echo "✅ SAST : aucun problème détecté"
+            echo "sast_status=clean"   >> $GITHUB_OUTPUT
+            echo "sast_blocking=false" >> $GITHUB_OUTPUT
+            echo "Aucun problème détecté"
           fi
 
       - name: Sauvegarde rapports SAST
@@ -623,11 +817,30 @@ jobs:
           path: /tmp/sast-reports/
           retention-days: 30
 
+      # ── Poster résumé dans la PR si applicable ─────────────────────────
+      - name: Commentaire résumé dans la Pull Request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const status  = "${{ steps.sast_result.outputs.sast_status }}";
+            const summary = "${{ steps.sast_result.outputs.sast_summary }}";
+            const blocking = "${{ steps.sast_result.outputs.sast_blocking }}";
+            const icon = status === 'clean' ? '✅' : blocking === 'true' ? '🚨' : '⚠️';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ${icon} Rapport SAST\n**Statut** : ${status}\n**Résumé** : ${summary}\n\n[Voir le rapport complet](${runUrl})`
+            });
+
 # ════════════════════════════════════════════════════════════════════════════
-#  JOB 5 — DAST : OWASP ZAP (remplace Amazon Inspector)
+#  JOB 5 — DAST : OWASP ZAP Full Scan + API Scan OpenAPI
 # ════════════════════════════════════════════════════════════════════════════
   job5_dast:
-    name: "JOB 5 — DAST OWASP ZAP"
+    name: "JOB 5 — DAST OWASP ZAP Full + API Scan"
     runs-on: ubuntu-latest
     needs: [job1_create_vm, job3_start_app]
     if: |
@@ -645,152 +858,252 @@ jobs:
       - name: Checkout du depot
         uses: actions/checkout@v4
 
+      # ── Création fichier de règles ZAP si absent ────────────────────────
+      - name: Creation fichier regles ZAP (.zap/rules.tsv)
+        run: |
+          mkdir -p .zap
+          if [ ! -f ".zap/rules.tsv" ]; then
+            cat > .zap/rules.tsv << 'EOF'
+          # Règles ZAP à ignorer (faux positifs courants en développement)
+          # Format : ID_règle TAB action (IGNORE/WARN/FAIL)
+          10015	IGNORE	Incomplete or No Cache-control Header Set
+          10027	IGNORE	Information Disclosure - Suspicious Comments
+          10096	IGNORE	Timestamp Disclosure
+          90022	IGNORE	Application Error Disclosure
+          EOF
+            echo "Fichier .zap/rules.tsv créé"
+          else
+            echo "Fichier .zap/rules.tsv existant conservé"
+          fi
+
       - name: Attente stabilisation application (30s)
         run: |
-          echo "Attente que l'application soit bien stable..."
+          echo "Attente que l'application soit stable..."
           sleep 30
+          echo "Test connectivité backend..."
+          curl -s --max-time 10 http://${{ env.VM_IP }}:8080 -o /dev/null && \
+            echo "Backend accessible" || echo "Backend pas encore prêt"
 
-      # ── Scan ZAP sur le Backend Spring Boot ────────────────────────────
-      - name: DAST — ZAP scan Backend (port 8080)
+      # ── ZAP Full Scan Backend Spring Boot ───────────────────────────────
+      - name: DAST — ZAP Full Scan Backend (port 8080)
         id: zap_backend
-        uses: zaproxy/action-baseline@v0.12.0
+        uses: zaproxy/action-full-scan@v0.10.0
         continue-on-error: true
         with:
           target: "http://${{ env.VM_IP }}:8080"
+          rules_file_name: ".zap/rules.tsv"
           fail_action: false
           artifact_name: zap-report-backend
-          cmd_options: "-a -j"
+          cmd_options: "-T 5 -a"
 
-      # ── Scan ZAP sur le Frontend Angular ───────────────────────────────
-      - name: DAST — ZAP scan Frontend Angular (port 4200)
+      # ── ZAP Full Scan Frontend Angular ──────────────────────────────────
+      - name: DAST — ZAP Full Scan Frontend Angular (port 4200)
         id: zap_frontend
-        uses: zaproxy/action-baseline@v0.12.0
+        uses: zaproxy/action-full-scan@v0.10.0
         continue-on-error: true
         with:
           target: "http://${{ env.VM_IP }}:4200"
+          rules_file_name: ".zap/rules.tsv"
           fail_action: false
           artifact_name: zap-report-frontend
-          cmd_options: "-a -j"
+          cmd_options: "-T 5 -a"
 
-      # ── Lecture des résultats et comptage ──────────────────────────────
-      - name: Recuperation et comptage des alertes ZAP
+      # ── ZAP API Scan (OpenAPI/Swagger si disponible) ────────────────────
+      - name: Detection Swagger Spring Boot
+        id: detect_swagger
+        run: |
+          HTTP=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
+            http://${{ env.VM_IP }}:8080/v3/api-docs 2>/dev/null || echo "000")
+          if [ "$HTTP" = "200" ]; then
+            echo "swagger_available=true" >> $GITHUB_OUTPUT
+            echo "Swagger détecté sur /v3/api-docs"
+          else
+            HTTP2=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
+              http://${{ env.VM_IP }}:8080/swagger-ui.html 2>/dev/null || echo "000")
+            if [ "$HTTP2" != "000" ]; then
+              echo "swagger_available=true" >> $GITHUB_OUTPUT
+              echo "Swagger UI détecté"
+            else
+              echo "swagger_available=false" >> $GITHUB_OUTPUT
+              echo "Swagger non disponible — API Scan ignoré"
+            fi
+          fi
+
+      - name: DAST — ZAP API Scan (routes OpenAPI)
+        id: zap_api
+        if: steps.detect_swagger.outputs.swagger_available == 'true'
+        uses: zaproxy/action-api-scan@v0.7.0
+        continue-on-error: true
+        with:
+          target: "http://${{ env.VM_IP }}:8080/v3/api-docs"
+          format: openapi
+          rules_file_name: ".zap/rules.tsv"
+          fail_action: false
+          artifact_name: zap-report-api
+
+      # ── Collecte et comptage de toutes les alertes ──────────────────────
+      - name: Collecte et comptage alertes ZAP
         id: count_alerts
         run: |
           mkdir -p /tmp/dast-reports
 
-          # ZAP génère automatiquement report_json.json dans le répertoire courant
-          BACKEND_HIGH=0
-          FRONTEND_HIGH=0
-
-          if [ -f "zap-report-backend.json" ]; then
-            cp zap-report-backend.json /tmp/dast-reports/
-            BACKEND_HIGH=$(python3 -c "
+          count_alerts() {
+            local file=$1
+            python3 -c "
           import json
           try:
-            data=json.load(open('zap-report-backend.json'))
-            alerts=data.get('site',[])
-            count=sum(
-              1 for site in alerts
-              for alert in site.get('alerts',[])
-              if alert.get('riskcode','0') in ['2','3']
-            )
-            print(count)
-          except: print(0)" 2>/dev/null || echo "0")
-          fi
+            data=json.load(open('$file'))
+            high=sum(1 for s in data.get('site',[])
+                       for a in s.get('alerts',[])
+                       if str(a.get('riskcode','0'))=='3')
+            med=sum(1 for s in data.get('site',[])
+                      for a in s.get('alerts',[])
+                      if str(a.get('riskcode','0'))=='2')
+            print(high,med)
+          except: print(0,0)" 2>/dev/null || echo "0 0"
+          }
 
-          if [ -f "zap-report-frontend.json" ]; then
-            cp zap-report-frontend.json /tmp/dast-reports/
-            FRONTEND_HIGH=$(python3 -c "
-          import json
-          try:
-            data=json.load(open('zap-report-frontend.json'))
-            alerts=data.get('site',[])
-            count=sum(
-              1 for site in alerts
-              for alert in site.get('alerts',[])
-              if alert.get('riskcode','0') in ['2','3']
-            )
-            print(count)
-          except: print(0)" 2>/dev/null || echo "0")
-          fi
+          # Copie des rapports JSON
+          for f in zap-report-backend.json zap-report-frontend.json zap-report-api.json; do
+            [ -f "$f" ] && cp "$f" /tmp/dast-reports/ || true
+          done
 
-          echo "backend_alerts=$BACKEND_HIGH"   >> $GITHUB_OUTPUT
-          echo "frontend_alerts=$FRONTEND_HIGH" >> $GITHUB_OUTPUT
-          echo "DAST Backend  : $BACKEND_HIGH alerte(s) HIGH/MEDIUM"
-          echo "DAST Frontend : $FRONTEND_HIGH alerte(s) HIGH/MEDIUM"
+          read BACKEND_H BACKEND_M  <<< $(count_alerts "zap-report-backend.json")
+          read FRONTEND_H FRONTEND_M <<< $(count_alerts "zap-report-frontend.json")
+          read API_H API_M           <<< $(count_alerts "zap-report-api.json")
 
-      # ── Rapport HTML consolidé ──────────────────────────────────────────
+          echo "backend_high=$BACKEND_H"   >> $GITHUB_OUTPUT
+          echo "backend_med=$BACKEND_M"    >> $GITHUB_OUTPUT
+          echo "frontend_high=$FRONTEND_H" >> $GITHUB_OUTPUT
+          echo "frontend_med=$FRONTEND_M"  >> $GITHUB_OUTPUT
+          echo "api_high=$API_H"           >> $GITHUB_OUTPUT
+          echo "api_med=$API_M"            >> $GITHUB_OUTPUT
+
+          echo "Backend  — HIGH: $BACKEND_H  | MEDIUM: $BACKEND_M"
+          echo "Frontend — HIGH: $FRONTEND_H | MEDIUM: $FRONTEND_M"
+          echo "API      — HIGH: $API_H      | MEDIUM: $API_M"
+
+      # ── Génération rapport HTML consolidé enrichi ───────────────────────
       - name: Generation rapport DAST HTML consolide
         run: |
           python3 << 'PYEOF'
           import json
 
-          def load(path):
+          RISK_LABELS = {"3":"HIGH","2":"MEDIUM","1":"LOW","0":"INFO"}
+          RISK_COLORS = {"3":"#ff4444","2":"#ff9900","1":"#888","0":"#aaa"}
+
+          def parse_alerts(path, origin):
+              rows = []
+              total_h = total_m = 0
               try:
-                  with open(path) as f: return json.load(f)
-              except: return {}
+                  data = json.load(open(path))
+                  for site in data.get("site",[]):
+                      url = site.get("@name","")
+                      for alert in site.get("alerts",[]):
+                          risk  = str(alert.get("riskcode","0"))
+                          name  = (alert.get("name","") or "")[:80]
+                          desc  = (alert.get("desc","") or "")[:150].replace("<p>","").replace("</p>"," ")
+                          sol   = (alert.get("solution","") or "")[:120].replace("<p>","").replace("</p>"," ")
+                          count = alert.get("count",1)
+                          label = RISK_LABELS.get(risk,risk)
+                          color = RISK_COLORS.get(risk,"#888")
+                          if risk == "3": total_h += 1
+                          if risk == "2": total_m += 1
+                          rows.append(
+                            f"<tr><td><span style='background:{color};color:white;"
+                            f"padding:2px 6px;border-radius:4px;font-size:11px'>{label}</span></td>"
+                            f"<td>{origin}</td><td>{name}</td>"
+                            f"<td style='color:#666;font-size:11px'>{count} occurrence(s)</td>"
+                            f"<td style='font-size:11px'>{desc}</td>"
+                            f"<td style='font-size:11px;color:green'>{sol}</td></tr>"
+                          )
+              except: pass
+              return "".join(rows), total_h, total_m
 
-          RISK_LABELS = {"3": "HIGH", "2": "MEDIUM", "1": "LOW", "0": "INFORMATIONAL"}
-          RISK_COLORS = {"3": "#ff4444", "2": "#ff9900", "1": "#888", "0": "#aaa"}
-
-          rows = ""
-          total = 0
-          for origin, path in [("Backend :8080", "/tmp/dast-reports/zap-report-backend.json"),
-                                ("Frontend :4200", "/tmp/dast-reports/zap-report-frontend.json")]:
-              data = load(path)
-              for site in data.get("site", []):
-                  for alert in site.get("alerts", []):
-                      risk  = str(alert.get("riskcode", "0"))
-                      name  = (alert.get("name", "") or "")[:80]
-                      desc  = (alert.get("desc", "") or "")[:120].replace("<p>","").replace("</p>","")
-                      sol   = (alert.get("solution", "") or "")[:100].replace("<p>","").replace("</p>","")
-                      count = alert.get("count", 1)
-                      label = RISK_LABELS.get(risk, risk)
-                      color = RISK_COLORS.get(risk, "#888")
-                      total += 1
-                      rows += f"<tr><td style='color:{color}'><b>{label}</b></td><td>{origin}</td><td>{name}</td><td>{count}</td><td>{desc}</td><td>{sol}</td></tr>"
+          b_rows, b_h, b_m = parse_alerts("/tmp/dast-reports/zap-report-backend.json",  "Backend :8080")
+          f_rows, f_h, f_m = parse_alerts("/tmp/dast-reports/zap-report-frontend.json", "Frontend :4200")
+          a_rows, a_h, a_m = parse_alerts("/tmp/dast-reports/zap-report-api.json",      "API OpenAPI")
+          all_rows = b_rows + f_rows + a_rows
+          total_h  = b_h + f_h + a_h
+          total_m  = b_m + f_m + a_m
 
           html = f"""<!DOCTYPE html>
-          <html><head><meta charset='UTF-8'><title>Rapport DAST GMAO — OWASP ZAP</title>
+          <html><head><meta charset='UTF-8'>
+          <title>Rapport DAST GMAO — OWASP ZAP</title>
           <style>
-            body{{font-family:Arial,sans-serif;padding:20px;background:#f5f5f5}}
-            h1{{color:#232f3e}}
-            table{{width:100%;border-collapse:collapse;background:white}}
-            th{{background:#232f3e;color:white;padding:10px;text-align:left}}
-            td{{padding:8px;border-bottom:1px solid #ddd;font-size:12px;vertical-align:top}}
-            .summary{{background:white;padding:15px;margin-bottom:20px;border-left:4px solid #ff4444}}
+            body{{font-family:Arial,sans-serif;padding:24px;background:#f5f5f5;color:#222}}
+            h1{{color:#232f3e;border-bottom:3px solid #ff4444;padding-bottom:8px}}
+            h2{{color:#232f3e;margin-top:28px}}
+            table{{width:100%;border-collapse:collapse;background:white;
+                   margin-bottom:24px;box-shadow:0 1px 4px rgba(0,0,0,.1)}}
+            th{{background:#232f3e;color:white;padding:10px;text-align:left;font-size:13px}}
+            td{{padding:8px 10px;border-bottom:1px solid #eee;font-size:12px;vertical-align:top}}
+            tr:hover{{background:#fafafa}}
+            .summary{{display:flex;gap:16px;margin-bottom:24px;flex-wrap:wrap}}
+            .card{{background:white;padding:16px 24px;border-radius:8px;
+                   box-shadow:0 1px 4px rgba(0,0,0,.1);min-width:140px}}
+            .card .num{{font-size:32px;font-weight:bold}}
+            .card .num.red{{color:#ff4444}}
+            .card .num.orange{{color:#ff9900}}
+            .card .num.ok{{color:green}}
+            .card .lab{{font-size:12px;color:#666;margin-top:4px}}
           </style></head><body>
-          <h1>Rapport DAST — OWASP ZAP</h1>
+          <h1>Rapport DAST — OWASP ZAP Full Scan + API Scan</h1>
+
           <div class='summary'>
-            <b>Outil        :</b> OWASP ZAP Baseline Scan<br>
-            <b>Cibles       :</b> Backend :8080 + Frontend :4200<br>
-            <b>Total alertes:</b> {total}
+            <div class='card'>
+              <div class='num {"red" if total_h>0 else "ok"}'>{total_h}</div>
+              <div class='lab'>Alertes HIGH</div>
+            </div>
+            <div class='card'>
+              <div class='num {"orange" if total_m>0 else "ok"}'>{total_m}</div>
+              <div class='lab'>Alertes MEDIUM</div>
+            </div>
+            <div class='card'>
+              <div class='num {"red" if total_h+total_m>0 else "ok"}'>{total_h+total_m}</div>
+              <div class='lab'>Total à corriger</div>
+            </div>
           </div>
+
+          <h2>Toutes les alertes — Backend, Frontend et API</h2>
           <table>
             <tr><th>Risque</th><th>Cible</th><th>Alerte</th><th>Occurrences</th><th>Description</th><th>Solution</th></tr>
-            {rows or "<tr><td colspan='6' style='text-align:center;color:green'>✅ Aucune alerte détectée</td></tr>"}
+            {all_rows or "<tr><td colspan='6' style='text-align:center;padding:20px;color:green'>Aucune alerte HIGH/MEDIUM détectée</td></tr>"}
           </table>
           </body></html>"""
 
-          with open("/tmp/dast-reports/dast-report.html", "w") as f:
+          with open("/tmp/dast-reports/dast-report.html","w") as f:
               f.write(html)
-          print(f"Rapport DAST HTML généré — {total} alerte(s) au total")
+          print(f"Rapport DAST HTML généré — {total_h} HIGH, {total_m} MEDIUM")
           PYEOF
 
+      # ── Statut final DAST ───────────────────────────────────────────────
       - name: Statut final DAST
         id: dast_result
         run: |
-          BACKEND="${{ steps.count_alerts.outputs.backend_alerts }}"
-          FRONTEND="${{ steps.count_alerts.outputs.frontend_alerts }}"
-          TOTAL=$(( ${BACKEND:-0} + ${FRONTEND:-0} ))
-          SUMMARY="ZAP Backend: ${BACKEND:-0} alerte(s) | ZAP Frontend: ${FRONTEND:-0} alerte(s) | Total: $TOTAL"
+          BH="${{ steps.count_alerts.outputs.backend_high }}"
+          BM="${{ steps.count_alerts.outputs.backend_med }}"
+          FH="${{ steps.count_alerts.outputs.frontend_high }}"
+          FM="${{ steps.count_alerts.outputs.frontend_med }}"
+          AH="${{ steps.count_alerts.outputs.api_high }}"
+          AM="${{ steps.count_alerts.outputs.api_med }}"
+
+          TOTAL_H=$(( ${BH:-0}+${FH:-0}+${AH:-0} ))
+          TOTAL_M=$(( ${BM:-0}+${FM:-0}+${AM:-0} ))
+          TOTAL=$(( TOTAL_H + TOTAL_M ))
+
+          SUMMARY="HIGH: $TOTAL_H | MEDIUM: $TOTAL_M | Total: $TOTAL (Backend+Frontend+API)"
           echo "dast_summary=$SUMMARY" >> $GITHUB_OUTPUT
-          if [ "$TOTAL" -gt 0 ]; then
-            echo "dast_status=issues_found" >> $GITHUB_OUTPUT
-            echo "⚠️  DAST : $TOTAL alerte(s) HIGH/MEDIUM détectée(s)"
+
+          if [ "$TOTAL_H" -gt 0 ]; then
+            echo "dast_status=high_found"   >> $GITHUB_OUTPUT
+            echo "ALERTES HIGH détectées : $TOTAL_H"
+          elif [ "$TOTAL_M" -gt 0 ]; then
+            echo "dast_status=medium_found" >> $GITHUB_OUTPUT
+            echo "Alertes MEDIUM détectées : $TOTAL_M"
           else
             echo "dast_status=clean"        >> $GITHUB_OUTPUT
-            echo "✅ DAST : aucune alerte HIGH/MEDIUM détectée"
+            echo "Aucune alerte HIGH/MEDIUM"
           fi
 
       - name: Sauvegarde rapports DAST
@@ -801,6 +1114,23 @@ jobs:
           path: /tmp/dast-reports/
           retention-days: 30
 
+      # ── Commentaire résumé dans la PR ───────────────────────────────────
+      - name: Commentaire résumé dans la Pull Request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const status  = "${{ steps.dast_result.outputs.dast_status }}";
+            const summary = "${{ steps.dast_result.outputs.dast_summary }}";
+            const icon = status === 'clean' ? '✅' : status === 'high_found' ? '🚨' : '⚠️';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ${icon} Rapport DAST\n**Statut** : ${status}\n**Résumé** : ${summary}\n\n[Voir le rapport complet](${runUrl})`
+            });
 # ════════════════════════════════════════════════════════════════════════════
 #  JOB 6 — Monitoring CloudWatch
 # ════════════════════════════════════════════════════════════════════════════
