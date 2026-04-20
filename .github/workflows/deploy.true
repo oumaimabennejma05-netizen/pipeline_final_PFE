@@ -420,6 +420,19 @@ jobs:
       - name: Checkout du depot
         uses: actions/checkout@v4
 
+      # ── CORRECTION : téléchargement des sources depuis GitHub Releases ──
+      - name: Telechargement des sources pour analyse SAST
+        run: |
+          echo "Téléchargement des archives depuis GitHub Releases..."
+          cd $GITHUB_WORKSPACE
+          wget -q https://github.com/oumaimabennejma05-netizen/gmao-releases-/releases/download/v1.0/gmao-backend.tar.gz
+          wget -q https://github.com/oumaimabennejma05-netizen/gmao-releases-/releases/download/v1.0/gmao-frontend.tar.gz
+          tar xzf gmao-backend.tar.gz
+          tar xzf gmao-frontend.tar.gz
+          ls -la gmao-backend/ gmao-frontend/
+          rm -f gmao-backend.tar.gz gmao-frontend.tar.gz
+          echo "Sources prêtes pour analyse"
+
       # ── Fichier .semgrepignore auto si absent ───────────────────────────
       - name: Creation .semgrepignore si absent
         run: |

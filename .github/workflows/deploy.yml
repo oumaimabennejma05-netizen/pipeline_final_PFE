@@ -1391,9 +1391,6 @@ jobs:
 # ════════════════════════════════════════════════════════════════════════════
 #  JOB FINAL — Notification complète (SAST + DAST + Monitoring + Résumé)
 # ════════════════════════════════════════════════════════════════════════════
-# ════════════════════════════════════════════════════════════════════════════
-#  JOB FINAL — Notification complète (SAST + DAST + Monitoring + Résumé)
-# ════════════════════════════════════════════════════════════════════════════
   job_notify:
     name: "JOB FINAL — Notification et Resume"
     runs-on: ubuntu-latest
