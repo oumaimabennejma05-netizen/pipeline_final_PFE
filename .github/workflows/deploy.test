@@ -1138,24 +1138,24 @@ jobs:
       ALARM_CPU:   ${{ needs.job6_monitoring.outputs.alarm_cpu }}
       ALARM_MEM:   ${{ needs.job6_monitoring.outputs.alarm_mem }}
       ALARM_DISK:  ${{ needs.job6_monitoring.outputs.alarm_disk }}
-
+ 
     steps:
+      - name: Checkout du depot
+        uses: actions/checkout@v4
+ 
       - name: Resume complet du deploiement
         run: |
-          echo "════════════════════════════════════════"
-          echo "  RAPPORT DEPLOIEMENT GMAO  $(date '+%d/%m/%Y %H:%M:%S')"
-          echo "════════════════════════════════════════"
-          echo "JOB 0 — Validation    : $J0_STATUS"
-          echo "JOB 1 — VM EC2        : $J1_STATUS"
-          echo "JOB 2 — Post-install  : $J2_STATUS"
-          echo "JOB 3 — App           : $J3_STATUS"
-          echo "JOB 4 — SAST          : $J4_SAST"
-          echo "JOB 5 — DAST          : $J5_DAST"
-          echo "JOB 6 — CPU $CPU% | MEM $MEM% | DISK $DISK%"
-
+          echo "JOB 0 : $J0_STATUS"
+          echo "JOB 1 : $J1_STATUS"
+          echo "JOB 2 : $J2_STATUS"
+          echo "JOB 3 : $J3_STATUS"
+          echo "JOB 4 SAST : $J4_SAST"
+          echo "JOB 5 DAST : $J5_DAST"
+          echo "CPU: $CPU% | MEM: $MEM% | DISK: $DISK%"
+ 
       - name: Installation msmtp
         run: sudo apt-get install -y msmtp msmtp-mta -q
-
+ 
       - name: Configuration msmtp
         run: |
           cat > ~/.msmtprc << EOF
@@ -1172,244 +1172,7 @@ jobs:
           account default : gmail
           EOF
           chmod 600 ~/.msmtprc
-
-      - name: Ecriture du script Python d envoi emails
-        run: |
-          cat > /tmp/send_emails.py << 'PYEOF'
-import subprocess, os, sys
-
-def send_email(to_addr, subject, html_body):
-    msg = "\r\n".join([
-        "To: " + to_addr,
-        "From: " + os.environ.get("GMAIL_USER", ""),
-        "Subject: " + subject,
-        "MIME-Version: 1.0",
-        "Content-Type: text/html; charset=UTF-8",
-        "",
-        html_body
-    ])
-    result = subprocess.run(["msmtp", to_addr], input=msg, text=True, capture_output=True)
-    if result.returncode == 0:
-        print("OK Email envoye : " + subject)
-    else:
-        print("ERREUR : " + result.stderr)
-        sys.exit(1)
-
-TO          = "oumaimabn.amelmm@gmail.com"
-DATE        = os.environ.get("DATE", "")
-RUN_URL     = os.environ.get("RUN_URL", "")
-BRANCH      = os.environ.get("BRANCH", "")
-COMMIT      = os.environ.get("COMMIT", "")[:8]
-ACTOR       = os.environ.get("ACTOR", "")
-VM_IP       = os.environ.get("VM_IP", "")
-INSTANCE_ID = os.environ.get("INSTANCE_ID", "")
-J0          = os.environ.get("J0_STATUS", "")
-J1          = os.environ.get("J1_STATUS", "")
-J2          = os.environ.get("J2_STATUS", "")
-J3          = os.environ.get("J3_STATUS", "")
-J4_SAST     = os.environ.get("J4_SAST", "")
-J4_SUMMARY  = os.environ.get("J4_SUMMARY", "")
-J4_BLOCKING = os.environ.get("J4_BLOCKING", "false")
-J5_DAST     = os.environ.get("J5_DAST", "")
-J5_SUMMARY  = os.environ.get("J5_SUMMARY", "")
-CPU         = os.environ.get("CPU", "N/A")
-MEM         = os.environ.get("MEM", "N/A")
-DISK        = os.environ.get("DISK", "N/A")
-MEM_TOTAL   = os.environ.get("MEM_TOTAL", "N/A")
-MEM_USED    = os.environ.get("MEM_USED", "N/A")
-DISK_TOTAL  = os.environ.get("DISK_TOTAL", "N/A")
-DISK_USED   = os.environ.get("DISK_USED", "N/A")
-DISK_FREE   = os.environ.get("DISK_FREE", "N/A")
-UPTIME      = os.environ.get("UPTIME", "N/A")
-LOAD        = os.environ.get("LOAD", "N/A")
-BACKEND_S   = os.environ.get("BACKEND_S", "stopped")
-FRONTEND_S  = os.environ.get("FRONTEND_S", "stopped")
-ALARM_CPU   = os.environ.get("ALARM_CPU", "UNKNOWN")
-ALARM_MEM   = os.environ.get("ALARM_MEM", "UNKNOWN")
-ALARM_DISK  = os.environ.get("ALARM_DISK", "UNKNOWN")
-
-STYLE = ("<style>"
-"body{font-family:Arial,sans-serif;background:#f5f5f5;margin:0;padding:20px}"
-".container{max-width:700px;margin:auto;background:white;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.1)}"
-".header{padding:24px;text-align:center;color:white}"
-".header h1{margin:0;font-size:22px}"
-".header p{margin:8px 0 0;opacity:.9;font-size:14px}"
-".body{padding:24px}"
-".card{background:#f9f9f9;border-radius:6px;padding:16px;margin-bottom:16px}"
-".card h2{margin:0 0 12px;font-size:15px;color:#333}"
-".row{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:13px;gap:12px}"
-".label{color:#666;flex-shrink:0}"
-".value{font-weight:bold;color:#222;text-align:right}"
-"table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}"
-"th{background:#232f3e;color:white;padding:8px;text-align:left}"
-"td{padding:7px 8px;border-bottom:1px solid #eee;vertical-align:middle}"
-".btn{display:inline-block;background:#232f3e;color:white;padding:10px 20px;border-radius:6px;text-decoration:none;font-size:13px;margin-top:12px;margin-right:8px}"
-".btn-aws{background:#ff9900}"
-".badge{display:inline-block;padding:2px 10px;border-radius:10px;font-size:11px;font-weight:bold;color:white}"
-".url-box{background:#232f3e;color:#7ec8e3;padding:10px 14px;border-radius:6px;font-family:monospace;font-size:12px;margin-bottom:8px}"
-".footer{background:#f0f0f0;padding:14px;text-align:center;font-size:11px;color:#888}"
-"</style>")
-
-def badge(color, text):
-    return "<span class='badge' style='background:" + color + "'>" + text + "</span>"
-
-def job_badge(s):
-    if "success" in s: return badge("#2ea44f", "OK")
-    if "skipped" in s: return badge("#888", "IGNORE")
-    return badge("#ff4444", "ECHEC")
-
-def alarm_badge(state):
-    if state == "OK":    return badge("#2ea44f", "OK")
-    if state == "ALARM": return badge("#ff4444", "ALARME")
-    return badge("#888", "INCONNU")
-
-def status_badge(s):
-    if s == "running": return badge("#2ea44f", "EN MARCHE")
-    return badge("#ff4444", "ARRETE")
-
-def gauge(val, label):
-    try:
-        v = float(val)
-        color = "#2ea44f" if v < 70 else "#ff9900" if v < 85 else "#ff4444"
-        pct = min(v, 100)
-        return ("<div style='margin-bottom:14px'>"
-                "<div style='display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px'>"
-                "<span style='color:#555'>" + label + "</span>"
-                "<span style='font-weight:bold;color:" + color + "'>" + str(round(v,1)) + "%</span></div>"
-                "<div style='background:#e0e0e0;border-radius:6px;height:10px;overflow:hidden'>"
-                "<div style='background:" + color + ";width:" + str(pct) + "%;height:100%;border-radius:6px'></div>"
-                "</div></div>")
-    except:
-        return "<div style='margin-bottom:10px;font-size:13px'><span style='color:#555'>" + label + "</span> <span style='color:#888'>N/A</span></div>"
-
-# EMAIL 1 — SAST
-if J4_BLOCKING == "true":
-    sc, si = "#ff4444", "BLOQUANT - CVE critique"
-elif J4_SAST == "issues_found":
-    sc, si = "#ff9900", "AVERTISSEMENT"
-else:
-    sc, si = "#2ea44f", "PROPRE - aucune faille"
-
-html1 = ("<!DOCTYPE html><html><head><meta charset='UTF-8'>" + STYLE + "</head><body>"
-    "<div class='container'>"
-    "<div class='header' style='background:" + sc + "'><h1>Rapport SAST - Application GMAO</h1><p>" + DATE + "</p></div>"
-    "<div class='body'>"
-    "<div class='card' style='border-left:4px solid " + sc + "'><h2>Statut global</h2>"
-    "<div class='row'><span class='label'>Resultat</span><span class='value'>" + si + "</span></div>"
-    "<div class='row'><span class='label'>Resume</span><span class='value' style='font-size:11px'>" + J4_SUMMARY + "</span></div></div>"
-    "<div class='card' style='border-left:4px solid " + sc + "'><h2>Deploiement</h2>"
-    "<div class='row'><span class='label'>Branche</span><span class='value'>" + BRANCH + "</span></div>"
-    "<div class='row'><span class='label'>Commit</span><span class='value'>" + COMMIT + "</span></div>"
-    "<div class='row'><span class='label'>Declenche par</span><span class='value'>" + ACTOR + "</span></div>"
-    "<div class='row'><span class='label'>Date</span><span class='value'>" + DATE + "</span></div></div>"
-    "<div class='card' style='border-left:4px solid " + sc + "'><h2>Outils utilises</h2>"
-    "<table><tr><th>Outil</th><th>Role</th><th>Cible</th></tr>"
-    "<tr><td><b>Semgrep</b></td><td>Analyse code source</td><td>Fichiers .java et .ts</td></tr>"
-    "<tr><td><b>Trivy</b></td><td>CVE dependances</td><td>pom.xml et package.json</td></tr>"
-    "<tr><td><b>SpotBugs</b></td><td>Bugs bytecode Java</td><td>Classes compilees</td></tr></table></div>"
-    "<a href='" + RUN_URL + "' class='btn'>Voir dans GitHub Actions</a>"
-    "</div><div class='footer'>GMAO Pipeline CI/CD - rapport automatique</div></div></body></html>")
-send_email(TO, "[GMAO] SAST - " + si + " - " + DATE, html1)
-
-# EMAIL 2 — DAST
-if J5_DAST == "high_found":
-    dc, di = "#ff4444", "ALERTE HIGH"
-elif J5_DAST == "medium_found":
-    dc, di = "#ff9900", "ATTENTION MEDIUM"
-else:
-    dc, di = "#2ea44f", "OK - aucune alerte"
-
-html2 = ("<!DOCTYPE html><html><head><meta charset='UTF-8'>" + STYLE + "</head><body>"
-    "<div class='container'>"
-    "<div class='header' style='background:" + dc + "'><h1>Rapport DAST - Application GMAO</h1><p>" + DATE + "</p></div>"
-    "<div class='body'>"
-    "<div class='card' style='border-left:4px solid " + dc + "'><h2>Statut global</h2>"
-    "<div class='row'><span class='label'>Resultat DAST</span><span class='value'>" + di + "</span></div>"
-    "<div class='row'><span class='label'>Resume alertes</span><span class='value' style='font-size:11px'>" + J5_SUMMARY + "</span></div>"
-    "<div class='row'><span class='label'>Branche</span><span class='value'>" + BRANCH + "</span></div>"
-    "<div class='row'><span class='label'>Commit</span><span class='value'>" + COMMIT + "</span></div></div>"
-    "<div class='card' style='border-left:4px solid " + dc + "'><h2>Cibles scannees</h2>"
-    "<table><tr><th>Cible</th><th>URL</th><th>Type de scan</th></tr>"
-    "<tr><td>Backend Spring Boot</td><td>http://" + VM_IP + ":8080</td><td>ZAP Full Scan</td></tr>"
-    "<tr><td>Frontend Angular</td><td>http://" + VM_IP + ":4200</td><td>ZAP Full Scan</td></tr>"
-    "<tr><td>API REST</td><td>http://" + VM_IP + ":8080/v3/api-docs</td><td>ZAP API Scan</td></tr></table></div>"
-    "<div class='card' style='border-left:4px solid " + dc + "'><h2>Attaques testees par ZAP</h2>"
-    "<table><tr><th>Attaque</th><th>Description</th></tr>"
-    "<tr><td>Injection SQL</td><td>Acces base de donnees via formulaires</td></tr>"
-    "<tr><td>XSS</td><td>Injection de scripts malveillants</td></tr>"
-    "<tr><td>CSRF</td><td>Verification des tokens anti-falsification</td></tr>"
-    "<tr><td>Headers HTTP</td><td>En-tetes de securite manquants</td></tr>"
-    "<tr><td>CORS</td><td>Politique acces cross-origine</td></tr>"
-    "<tr><td>Path Traversal</td><td>Acces aux fichiers systeme</td></tr></table></div>"
-    "<a href='" + RUN_URL + "' class='btn'>Voir dans GitHub Actions</a>"
-    "</div><div class='footer'>GMAO Pipeline CI/CD - rapport automatique</div></div></body></html>")
-send_email(TO, "[GMAO] DAST - " + di + " - " + DATE, html2)
-
-# EMAIL 3 — Monitoring
-CW_URL = "https://console.aws.amazon.com/cloudwatch/home?region=us-east-1"
-html3 = ("<!DOCTYPE html><html><head><meta charset='UTF-8'>" + STYLE + "</head><body>"
-    "<div class='container'>"
-    "<div class='header' style='background:#232f3e'><h1>Rapport Monitoring - CloudWatch</h1><p>Application GMAO - " + DATE + "</p></div>"
-    "<div class='body'>"
-    "<div class='card' style='border-left:4px solid #232f3e'><h2>Utilisation des ressources (temps reel)</h2>"
-    + gauge(CPU, "CPU") + gauge(MEM, "Memoire RAM") + gauge(DISK, "Disque") +
-    "</div>"
-    "<div class='card' style='border-left:4px solid #232f3e'><h2>Detail memoire et disque</h2>"
-    "<table><tr><th>Ressource</th><th>Total</th><th>Utilise</th><th>Libre</th></tr>"
-    "<tr><td>RAM</td><td>" + MEM_TOTAL + "</td><td>" + MEM_USED + "</td><td>-</td></tr>"
-    "<tr><td>Disque (/)</td><td>" + DISK_TOTAL + "</td><td>" + DISK_USED + "</td><td>" + DISK_FREE + "</td></tr></table></div>"
-    "<div class='card' style='border-left:4px solid #232f3e'><h2>Etat des services applicatifs</h2>"
-    "<div class='row'><span class='label'>Backend Spring Boot (:8080)</span>" + status_badge(BACKEND_S) + "</div>"
-    "<div class='row'><span class='label'>Frontend Angular (:4200)</span>" + status_badge(FRONTEND_S) + "</div>"
-    "<div class='row'><span class='label'>Uptime serveur</span><span class='value'>" + UPTIME + "</span></div>"
-    "<div class='row'><span class='label'>Charge systeme</span><span class='value'>" + LOAD + "</span></div></div>"
-    "<div class='card' style='border-left:4px solid #232f3e'><h2>Etat des alarmes CloudWatch</h2>"
-    "<table><tr><th>Alarme</th><th>Seuil</th><th>Etat</th></tr>"
-    "<tr><td>CPU eleve</td><td>&gt; 80%</td><td>" + alarm_badge(ALARM_CPU) + "</td></tr>"
-    "<tr><td>Memoire elevee</td><td>&gt; 85%</td><td>" + alarm_badge(ALARM_MEM) + "</td></tr>"
-    "<tr><td>Disque plein</td><td>&gt; 90%</td><td>" + alarm_badge(ALARM_DISK) + "</td></tr></table></div>"
-    "<div class='card' style='border-left:4px solid #232f3e'><h2>Informations instance AWS</h2>"
-    "<div class='row'><span class='label'>Instance ID</span><span class='value'>" + INSTANCE_ID + "</span></div>"
-    "<div class='row'><span class='label'>IP publique</span><span class='value'>" + VM_IP + "</span></div>"
-    "<div class='row'><span class='label'>Region AWS</span><span class='value'>us-east-1</span></div></div>"
-    "<a href='" + RUN_URL + "' class='btn'>GitHub Actions</a>"
-    "<a href='" + CW_URL + "' class='btn btn-aws'>Ouvrir CloudWatch</a>"
-    "</div><div class='footer'>GMAO Pipeline CI/CD - monitoring automatique - " + DATE + "</div></div></body></html>")
-send_email(TO, "[GMAO] Monitoring CloudWatch - " + DATE, html3)
-
-# EMAIL 4 — Resume final
-if J1 == "success" and J3 == "success":
-    fc, fs = "#2ea44f", "DEPLOIEMENT REUSSI"
-else:
-    fc, fs = "#ff4444", "DEPLOIEMENT ECHOUE"
-
-html4 = ("<!DOCTYPE html><html><head><meta charset='UTF-8'>" + STYLE + "</head><body>"
-    "<div class='container'>"
-    "<div class='header' style='background:" + fc + "'><h1>" + fs + "</h1><p>Application GMAO - " + DATE + "</p></div>"
-    "<div class='body'>"
-    "<div class='card' style='border-left:4px solid " + fc + "'><h2>Informations du deploiement</h2>"
-    "<div class='row'><span class='label'>Branche</span><span class='value'>" + BRANCH + "</span></div>"
-    "<div class='row'><span class='label'>Commit</span><span class='value'>" + COMMIT + "</span></div>"
-    "<div class='row'><span class='label'>Declenche par</span><span class='value'>" + ACTOR + "</span></div>"
-    "<div class='row'><span class='label'>Date</span><span class='value'>" + DATE + "</span></div></div>"
-    "<div class='card' style='border-left:4px solid " + fc + "'><h2>Statut de chaque job</h2>"
-    "<div class='row'><span class='label'>JOB 0 - Validation code</span>" + job_badge(J0) + "</div>"
-    "<div class='row'><span class='label'>JOB 1 - Creation VM EC2</span>" + job_badge(J1) + "</div>"
-    "<div class='row'><span class='label'>JOB 2 - Post-installation</span>" + job_badge(J2) + "</div>"
-    "<div class='row'><span class='label'>JOB 3 - Demarrage application</span>" + job_badge(J3) + "</div>"
-    "<div class='row'><span class='label'>JOB 4 - SAST</span><span class='value' style='font-size:11px'>" + J4_SAST + " - " + J4_SUMMARY + "</span></div>"
-    "<div class='row'><span class='label'>JOB 5 - DAST</span><span class='value' style='font-size:11px'>" + J5_DAST + " - " + J5_SUMMARY + "</span></div>"
-    "<div class='row'><span class='label'>JOB 6 - Monitoring</span><span class='value' style='font-size:11px'>CPU: " + CPU + "% | MEM: " + MEM + "% | DISK: " + DISK + "%</span></div></div>"
-    "<div class='card' style='border-left:4px solid " + fc + "'><h2>Acces a l application</h2>"
-    "<div class='url-box'>Backend  : http://" + VM_IP + ":8080</div>"
-    "<div class='url-box'>Frontend : http://" + VM_IP + ":4200</div></div>"
-    "<a href='" + RUN_URL + "' class='btn'>Voir dans GitHub Actions</a>"
-    "</div><div class='footer'>GMAO Pipeline CI/CD - resume automatique - " + DATE + "</div></div></body></html>")
-send_email(TO, "[GMAO] " + fs + " - " + DATE, html4)
-
-print("Tous les emails ont ete envoyes avec succes.")
-PYEOF
-
+ 
       - name: Envoi des 4 emails de rapport
         env:
           RUN_URL:     ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -1445,4 +1208,4 @@ PYEOF
           GMAIL_USER:  ${{ secrets.GMAIL_USER }}
         run: |
           export DATE=$(date '+%d/%m/%Y %H:%M:%S')
-          python3 /tmp/send_emails.py
+          python3 scripts/send_emails.py
