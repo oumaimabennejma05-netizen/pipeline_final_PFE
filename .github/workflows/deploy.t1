@@ -442,39 +442,38 @@ jobs:
           fi
 
       # ── Semgrep Backend Java ────────────────────────────────────────────
-      - name: SAST — Semgrep Backend Java
-        id: semgrep_backend
-        continue-on-error: true
-        run: |
-          pip install semgrep --break-system-packages -q
-          mkdir -p /tmp/sast-reports
+      - name: SAST — SpotBugs Backend Java
+  id: spotbugs
+  continue-on-error: true
+  run: |
+    echo "Téléchargement du backend pour SpotBugs..."
 
-          semgrep scan \
-            --config "p/java" \
-            --config "p/owasp-top-ten" \
-            --config "p/secrets" \
-            --json \
-            --output /tmp/sast-reports/semgrep-backend.json \
-            gmao-backend/ 2>/dev/null || true
+    # Télécharger l'archive comme le fait 02_post_install.sh
+    wget -q https://github.com/oumaimabennejma05-netizen/gmao-releases-/releases/download/v1.0/gmao-backend.tar.gz
+    tar xzf gmao-backend.tar.gz
 
-          COUNT=$(python3 -c "
-          import json
-          try:
-            data=json.load(open('/tmp/sast-reports/semgrep-backend.json'))
-            print(len(data.get('results',[])))
-          except: print(0)" 2>/dev/null || echo "0")
+    echo "Compilation du backend pour SpotBugs..."
+    cd gmao-backend
 
-          CRITICAL=$(python3 -c "
-          import json
-          try:
-            data=json.load(open('/tmp/sast-reports/semgrep-backend.json'))
-            print(sum(1 for r in data.get('results',[])
-              if r.get('extra',{}).get('severity','') == 'ERROR'))
-          except: print(0)" 2>/dev/null || echo "0")
+    mvn compile spotbugs:spotbugs \
+      -Dplugin.version=4.8.3 \
+      --no-transfer-progress -q 2>/dev/null || true
 
-          echo "semgrep_backend_total=$COUNT"       >> $GITHUB_OUTPUT
-          echo "semgrep_backend_critical=$CRITICAL" >> $GITHUB_OUTPUT
-          echo "Semgrep Backend : $COUNT finding(s) dont $CRITICAL critique(s)"
+    if [ -f "target/spotbugsXml.xml" ]; then
+      cp target/spotbugsXml.xml /tmp/sast-reports/spotbugs.xml
+      COUNT=$(python3 -c "
+    import xml.etree.ElementTree as ET
+    try:
+      tree=ET.parse('/tmp/sast-reports/spotbugs.xml')
+      print(len(tree.findall('.//BugInstance')))
+    except: print(0)")
+      echo "SpotBugs : $COUNT bug(s) détecté(s)"
+      echo "spotbugs_count=$COUNT" >> $GITHUB_OUTPUT
+    else
+      echo "SpotBugs : rapport non généré"
+      echo "spotbugs_count=0" >> $GITHUB_OUTPUT
+      echo "<BugCollection/>" > /tmp/sast-reports/spotbugs.xml
+    fi
 
       # ── Semgrep Frontend TypeScript ─────────────────────────────────────
       - name: SAST — Semgrep Frontend TypeScript
@@ -1227,36 +1226,52 @@ jobs:
             echo "CloudWatch Agent demarre"
           SSHEOF
 
-      - name: Creation alarmes CloudWatch
-        run: |
-          TOPIC_ARN=$(aws sns create-topic \
-            --name gmao-alerts \
-            --query 'TopicArn' --output text)
-          echo "TOPIC_ARN=$TOPIC_ARN" >> $GITHUB_ENV
-          aws sns subscribe \
-            --topic-arn "$TOPIC_ARN" \
-            --protocol email \
-            --notification-endpoint "oumaimabn.amelmm@gmail.com"
-          for ALARM in \
-            "gmao-cpu-high|CPU GMAO > 80%|CPUUtilization|AWS/EC2|80" \
-            "gmao-memory-high|Memoire GMAO > 85%|mem_used_percent|GMAO/EC2|85" \
-            "gmao-disk-full|Disque GMAO > 90%|disk_used_percent|GMAO/EC2|90"; do
-            NAME=$(echo $ALARM      | cut -d'|' -f1)
-            DESC=$(echo $ALARM      | cut -d'|' -f2)
-            METRIC=$(echo $ALARM    | cut -d'|' -f3)
-            NS=$(echo $ALARM        | cut -d'|' -f4)
-            THRESHOLD=$(echo $ALARM | cut -d'|' -f5)
-            aws cloudwatch put-metric-alarm \
-              --alarm-name "$NAME" --alarm-description "$DESC" \
-              --metric-name "$METRIC" --namespace "$NS" \
-              --statistic Average \
-              --dimensions Name=InstanceId,Value=${{ env.INSTANCE_ID }} \
-              --period 300 --evaluation-periods 1 \
-              --threshold $THRESHOLD \
-              --comparison-operator GreaterThanThreshold \
-              --alarm-actions "$TOPIC_ARN" --ok-actions "$TOPIC_ARN"
-          done
-          echo "Alarmes CloudWatch creees"
+     - name: Creation alarmes CloudWatch
+  run: |
+    # Créer le topic SNS
+    TOPIC_ARN=$(aws sns create-topic \
+      --name gmao-alerts \
+      --query 'TopicArn' --output text)
+    echo "TOPIC_ARN=$TOPIC_ARN" >> $GITHUB_ENV
+
+    # Vérifier si l'abonnement email existe déjà et est confirmé
+    EXISTING=$(aws sns list-subscriptions-by-topic \
+      --topic-arn "$TOPIC_ARN" \
+      --query "Subscriptions[?Endpoint=='oumaimabn.amelmm@gmail.com' && SubscriptionArn!='PendingConfirmation'].SubscriptionArn" \
+      --output text 2>/dev/null || echo "")
+
+    if [ -z "$EXISTING" ]; then
+      echo "Abonnement email en attente — création..."
+      aws sns subscribe \
+        --topic-arn "$TOPIC_ARN" \
+        --protocol email \
+        --notification-endpoint "oumaimabn.amelmm@gmail.com"
+      echo "⚠️ Vérifie ta boite mail et clique sur Confirm subscription !"
+    else
+      echo "✅ Abonnement email déjà confirmé : $EXISTING"
+    fi
+
+    # Créer les alarmes
+    for ALARM in \
+      "gmao-cpu-high|CPU GMAO > 80%|CPUUtilization|AWS/EC2|80" \
+      "gmao-memory-high|Memoire GMAO > 85%|mem_used_percent|GMAO/EC2|85" \
+      "gmao-disk-full|Disque GMAO > 90%|disk_used_percent|GMAO/EC2|90"; do
+      NAME=$(echo $ALARM      | cut -d'|' -f1)
+      DESC=$(echo $ALARM      | cut -d'|' -f2)
+      METRIC=$(echo $ALARM    | cut -d'|' -f3)
+      NS=$(echo $ALARM        | cut -d'|' -f4)
+      THRESHOLD=$(echo $ALARM | cut -d'|' -f5)
+      aws cloudwatch put-metric-alarm \
+        --alarm-name "$NAME" --alarm-description "$DESC" \
+        --metric-name "$METRIC" --namespace "$NS" \
+        --statistic Average \
+        --dimensions Name=InstanceId,Value=${{ env.INSTANCE_ID }} \
+        --period 300 --evaluation-periods 1 \
+        --threshold $THRESHOLD \
+        --comparison-operator GreaterThanThreshold \
+        --alarm-actions "$TOPIC_ARN" --ok-actions "$TOPIC_ARN"
+    done
+    echo "✅ Alarmes CloudWatch créées"
 
       # ── Collecte métriques réelles depuis CloudWatch ────────────────────
       - name: Collecte metriques CloudWatch pour rapport
