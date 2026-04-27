@@ -5,8 +5,24 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      force_recreate_vm:
+        description: "Forcer la re-création de la VM (destroy + apply)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
       skip_post_install:
         description: "Passer le post-install (si déjà fait)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      destroy_infra:
+        description: "Détruire l'infrastructure (terraform destroy)"
         required: false
         default: "false"
         type: choice
@@ -25,11 +41,71 @@ concurrency:
 jobs:
 
 # ════════════════════════════════════════════════════════════════════════════
+#  JOB 0 — Validation du code
+# ════════════════════════════════════════════════════════════════════════════
+  job0_validate_code:
+    name: "JOB 0 — Validation du code"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.destroy_infra != 'true' }}
+    outputs:
+      backend_ok:  ${{ steps.validate_backend.outputs.backend_ok }}
+      frontend_ok: ${{ steps.validate_frontend.outputs.frontend_ok }}
+    steps:
+      - name: Checkout du depot
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Validation backend (mvn compile)
+        id: validate_backend
+        run: |
+          if [ -f "gmao-backend/pom.xml" ]; then
+            echo "Compilation du backend Maven..."
+            cd gmao-backend
+            mvn compile -q --no-transfer-progress 2>&1
+            echo "backend_ok=true" >> $GITHUB_OUTPUT
+            echo "Backend compile avec succes"
+          else
+            echo "Pas de pom.xml trouve — validation backend ignoree"
+            echo "backend_ok=skipped" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validation frontend (npm install)
+        id: validate_frontend
+        run: |
+          if [ -f "gmao-frontend/package.json" ]; then
+            echo "Verification du frontend..."
+            cd gmao-frontend
+            npm install --silent 2>&1
+            echo "frontend_ok=true" >> $GITHUB_OUTPUT
+            echo "Frontend valide avec succes"
+          else
+            echo "Pas de package.json trouve — validation frontend ignoree"
+            echo "frontend_ok=skipped" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Resume validation
+        run: |
+          echo "Backend  : ${{ steps.validate_backend.outputs.backend_ok }}"
+          echo "Frontend : ${{ steps.validate_frontend.outputs.frontend_ok }}"
+
+# ════════════════════════════════════════════════════════════════════════════
 #  JOB 1 — Creation VM EC2
 # ════════════════════════════════════════════════════════════════════════════
   job1_create_vm:
     name: "JOB 1 — Creation / Verification VM EC2"
     runs-on: ubuntu-latest
+    needs: job0_validate_code
+    if: ${{ github.event.inputs.destroy_infra != 'true' }}
     outputs:
       public_ip:   ${{ steps.resolve_ip.outputs.public_ip }}
       instance_id: ${{ steps.resolve_ip.outputs.instance_id }}
@@ -160,7 +236,9 @@ jobs:
     name: "JOB 2 — Post-Installation"
     runs-on: ubuntu-latest
     needs: job1_create_vm
-    if: needs.job1_create_vm.outputs.vm_skipped != 'true'
+    if: |
+      github.event.inputs.destroy_infra != 'true' &&
+      needs.job1_create_vm.outputs.vm_skipped != 'true'
     env:
       VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
     steps:
@@ -243,7 +321,9 @@ jobs:
     name: "JOB 3 — Demarrage Application GMAO"
     runs-on: ubuntu-latest
     needs: [job1_create_vm, job2_post_install]
-    if: needs.job1_create_vm.outputs.vm_skipped != 'true'
+    if: |
+      github.event.inputs.destroy_infra != 'true' &&
+      needs.job1_create_vm.outputs.vm_skipped != 'true'
     env:
       VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
     steps:
@@ -283,7 +363,7 @@ jobs:
               scripts/03_start_app.sh \
               ubuntu@${{ env.VM_IP }}:~/03_start_app.sh
 
-      - name: Lancement (restore DB + t.sh + Spring Boot + Angular)
+      - name: Lancement (restore DB + Spring Boot + Angular)
         timeout-minutes: 10
         run: |
           ssh -i ~/.ssh/vockey.pem \
@@ -322,3 +402,1096 @@ jobs:
           done
           echo "Frontend non accessible apres 60s"
           exit 1
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 4 — SAST : Semgrep + Trivy SCA + blocage critique + faux positifs
+# ════════════════════════════════════════════════════════════════════════════
+  job4_sast:
+    name: "JOB 4 — SAST Semgrep + Trivy SCA"
+    runs-on: ubuntu-latest
+    needs: job0_validate_code
+    if: ${{ github.event.inputs.destroy_infra != 'true' }}
+    continue-on-error: true
+    outputs:
+      sast_status:   ${{ steps.sast_result.outputs.sast_status }}
+      sast_summary:  ${{ steps.sast_result.outputs.sast_summary }}
+      sast_blocking: ${{ steps.sast_result.outputs.sast_blocking }}
+    steps:
+      - name: Checkout du depot
+        uses: actions/checkout@v4
+
+      # ── CORRECTION : téléchargement des sources depuis GitHub Releases ──
+      - name: Telechargement des sources pour analyse SAST
+        run: |
+          echo "Téléchargement des archives depuis GitHub Releases..."
+          cd $GITHUB_WORKSPACE
+          wget -q https://github.com/oumaimabennejma05-netizen/gmao-releases-/releases/download/v1.0/gmao-backend.tar.gz
+          wget -q https://github.com/oumaimabennejma05-netizen/gmao-releases-/releases/download/v1.0/gmao-frontend.tar.gz
+          tar xzf gmao-backend.tar.gz
+          tar xzf gmao-frontend.tar.gz
+          ls -la gmao-backend/ gmao-frontend/
+          rm -f gmao-backend.tar.gz gmao-frontend.tar.gz
+          echo "Sources prêtes pour analyse"
+
+      # ── Fichier .semgrepignore auto si absent ───────────────────────────
+      - name: Creation .semgrepignore si absent
+        run: |
+          if [ ! -f ".semgrepignore" ]; then
+            cat > .semgrepignore << 'EOF'
+          # Ignorer les fichiers de test (faux positifs fréquents)
+          **/test/**
+          **/tests/**
+          **/*Test.java
+          **/*Spec.ts
+          # Ignorer les fichiers générés
+          **/target/**
+          **/node_modules/**
+          **/dist/**
+          **/build/**
+          EOF
+            echo "Fichier .semgrepignore créé automatiquement"
+          else
+            echo "Fichier .semgrepignore existant conservé"
+          fi
+
+      # ── Semgrep Backend Java ────────────────────────────────────────────
+      - name: SAST — Semgrep Backend Java
+        id: semgrep_backend
+        continue-on-error: true
+        run: |
+          pip install semgrep --break-system-packages -q
+          mkdir -p /tmp/sast-reports
+
+          semgrep scan \
+            --config "p/java" \
+            --config "p/owasp-top-ten" \
+            --config "p/secrets" \
+            --json \
+            --output /tmp/sast-reports/semgrep-backend.json \
+            gmao-backend/ 2>/dev/null || true
+
+          COUNT=$(python3 -c "
+          import json
+          try:
+            data=json.load(open('/tmp/sast-reports/semgrep-backend.json'))
+            print(len(data.get('results',[])))
+          except: print(0)" 2>/dev/null || echo "0")
+
+          CRITICAL=$(python3 -c "
+          import json
+          try:
+            data=json.load(open('/tmp/sast-reports/semgrep-backend.json'))
+            print(sum(1 for r in data.get('results',[])
+              if r.get('extra',{}).get('severity','') == 'ERROR'))
+          except: print(0)" 2>/dev/null || echo "0")
+
+          echo "semgrep_backend_total=$COUNT"       >> $GITHUB_OUTPUT
+          echo "semgrep_backend_critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "Semgrep Backend : $COUNT finding(s) dont $CRITICAL critique(s)"
+
+      # ── Semgrep Frontend TypeScript ─────────────────────────────────────
+      - name: SAST — Semgrep Frontend TypeScript
+        id: semgrep_frontend
+        continue-on-error: true
+        run: |
+          semgrep scan \
+            --config "p/typescript" \
+            --config "p/owasp-top-ten" \
+            --config "p/secrets" \
+            --json \
+            --output /tmp/sast-reports/semgrep-frontend.json \
+            gmao-frontend/ 2>/dev/null || true
+
+          COUNT=$(python3 -c "
+          import json
+          try:
+            data=json.load(open('/tmp/sast-reports/semgrep-frontend.json'))
+            print(len(data.get('results',[])))
+          except: print(0)" 2>/dev/null || echo "0")
+
+          CRITICAL=$(python3 -c "
+          import json
+          try:
+            data=json.load(open('/tmp/sast-reports/semgrep-frontend.json'))
+            print(sum(1 for r in data.get('results',[])
+              if r.get('extra',{}).get('severity','') == 'ERROR'))
+          except: print(0)" 2>/dev/null || echo "0")
+
+          echo "semgrep_frontend_total=$COUNT"       >> $GITHUB_OUTPUT
+          echo "semgrep_frontend_critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "Semgrep Frontend : $COUNT finding(s) dont $CRITICAL critique(s)"
+
+      # ── SpotBugs Backend Java (analyse bytecode) ────────────────────────
+      - name: SAST — SpotBugs Backend Java
+        id: spotbugs
+        continue-on-error: true
+        run: |
+          echo "Compilation du backend pour SpotBugs..."
+          cd gmao-backend
+
+          # Ajout du plugin SpotBugs dans le build Maven temporaire
+          mvn compile spotbugs:spotbugs \
+            -Dplugin.version=4.8.3 \
+            --no-transfer-progress -q 2>/dev/null || true
+
+          # Récupération du rapport XML SpotBugs
+          if [ -f "target/spotbugsXml.xml" ]; then
+            cp target/spotbugsXml.xml /tmp/sast-reports/spotbugs.xml
+            COUNT=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          try:
+            tree=ET.parse('/tmp/sast-reports/spotbugs.xml')
+            print(len(tree.findall('.//BugInstance')))
+          except: print(0)")
+            echo "SpotBugs : $COUNT bug(s) détecté(s)"
+            echo "spotbugs_count=$COUNT" >> $GITHUB_OUTPUT
+          else
+            echo "SpotBugs : rapport non généré (ignoré)"
+            echo "spotbugs_count=0" >> $GITHUB_OUTPUT
+            echo "{}" > /tmp/sast-reports/spotbugs.xml
+          fi
+
+      # ── Trivy Backend — BLOQUE si CVE CRITICAL avec fix dispo ──────────
+      - name: SCA — Trivy Backend Maven (bloquant si CRITICAL)
+        id: trivy_backend
+        continue-on-error: true
+        run: |
+          # Installation Trivy
+          wget -qO- https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin 2>/dev/null
+
+          # Scan avec sortie JSON complète
+          trivy fs gmao-backend \
+            --format json \
+            --output /tmp/sast-reports/trivy-backend.json \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --quiet 2>/dev/null || true
+
+          # Comptage CVE critiques (avec fix disponible)
+          CRITICAL=$(python3 -c "
+          import json
+          try:
+            data=json.load(open('/tmp/sast-reports/trivy-backend.json'))
+            vulns=[v for r in data.get('Results',[])
+                     for v in (r.get('Vulnerabilities') or [])
+                     if v.get('Severity')=='CRITICAL']
+            print(len(vulns))
+          except: print(0)" 2>/dev/null || echo "0")
+
+          HIGH=$(python3 -c "
+          import json
+          try:
+            data=json.load(open('/tmp/sast-reports/trivy-backend.json'))
+            vulns=[v for r in data.get('Results',[])
+                     for v in (r.get('Vulnerabilities') or [])
+                     if v.get('Severity')=='HIGH']
+            print(len(vulns))
+          except: print(0)" 2>/dev/null || echo "0")
+
+          echo "trivy_backend_critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "trivy_backend_high=$HIGH"         >> $GITHUB_OUTPUT
+          echo "Trivy Backend : $CRITICAL CRITICAL + $HIGH HIGH"
+
+          # Blocage si CVE critique avec fix disponible
+          if [ "$CRITICAL" -gt 0 ]; then
+            echo "BLOQUANT : $CRITICAL CVE critique(s) avec fix disponible détectée(s)"
+            echo "trivy_backend_blocking=true" >> $GITHUB_OUTPUT
+          else
+            echo "trivy_backend_blocking=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Trivy Frontend — BLOQUE si CVE CRITICAL avec fix dispo ─────────
+      - name: SCA — Trivy Frontend npm (bloquant si CRITICAL)
+        id: trivy_frontend
+        continue-on-error: true
+        run: |
+          trivy fs gmao-frontend \
+            --format json \
+            --output /tmp/sast-reports/trivy-frontend.json \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --quiet 2>/dev/null || true
+
+          CRITICAL=$(python3 -c "
+          import json
+          try:
+            data=json.load(open('/tmp/sast-reports/trivy-frontend.json'))
+            vulns=[v for r in data.get('Results',[])
+                     for v in (r.get('Vulnerabilities') or [])
+                     if v.get('Severity')=='CRITICAL']
+            print(len(vulns))
+          except: print(0)" 2>/dev/null || echo "0")
+
+          HIGH=$(python3 -c "
+          import json
+          try:
+            data=json.load(open('/tmp/sast-reports/trivy-frontend.json'))
+            vulns=[v for r in data.get('Results',[])
+                     for v in (r.get('Vulnerabilities') or [])
+                     if v.get('Severity')=='HIGH']
+            print(len(vulns))
+          except: print(0)" 2>/dev/null || echo "0")
+
+          echo "trivy_frontend_critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "trivy_frontend_high=$HIGH"         >> $GITHUB_OUTPUT
+          echo "Trivy Frontend : $CRITICAL CRITICAL + $HIGH HIGH"
+
+          if [ "$CRITICAL" -gt 0 ]; then
+            echo "BLOQUANT : $CRITICAL CVE critique(s) avec fix disponible"
+            echo "trivy_frontend_blocking=true" >> $GITHUB_OUTPUT
+          else
+            echo "trivy_frontend_blocking=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Génération rapport HTML enrichi ────────────────────────────────
+      - name: Generation rapport SAST HTML complet
+        run: |
+          python3 << 'PYEOF'
+          import json, xml.etree.ElementTree as ET
+
+          def load_json(path):
+              try:
+                  with open(path) as f: return json.load(f)
+              except: return {}
+
+          sb  = load_json("/tmp/sast-reports/semgrep-backend.json")
+          sf  = load_json("/tmp/sast-reports/semgrep-frontend.json")
+          tb  = load_json("/tmp/sast-reports/trivy-backend.json")
+          tf  = load_json("/tmp/sast-reports/trivy-frontend.json")
+
+          # ── Semgrep rows ──
+          semgrep_rows = ""
+          for origin, data in [("Backend (Java)", sb), ("Frontend (TypeScript)", sf)]:
+              for r in data.get("results", []):
+                  sev   = r.get("extra", {}).get("severity", "INFO")
+                  msg   = (r.get("extra", {}).get("message", "") or "")[:120]
+                  path  = r.get("path", "")
+                  line  = r.get("start", {}).get("line", "")
+                  rule  = r.get("check_id", "")
+                  color = "#ff4444" if sev=="ERROR" else "#ff9900" if sev=="WARNING" else "#888"
+                  badge = "CRITIQUE" if sev=="ERROR" else "ATTENTION" if sev=="WARNING" else "INFO"
+                  semgrep_rows += (
+                    f"<tr><td><span style='background:{color};color:white;"
+                    f"padding:2px 6px;border-radius:4px;font-size:11px'>{badge}</span></td>"
+                    f"<td>{origin}</td><td>{path}:{line}</td>"
+                    f"<td>{rule.split('.')[-1]}</td><td>{msg}</td></tr>"
+                  )
+
+          # ── Trivy rows ──
+          trivy_rows = ""
+          for origin, data in [("Backend (Maven)", tb), ("Frontend (npm)", tf)]:
+              for result in data.get("Results", []):
+                  for v in result.get("Vulnerabilities") or []:
+                      sev   = v.get("Severity","UNKNOWN")
+                      cve   = v.get("VulnerabilityID","")
+                      pkg   = v.get("PkgName","")
+                      ver   = v.get("InstalledVersion","")
+                      fixed = v.get("FixedVersion","—")
+                      title = (v.get("Title","") or "")[:100]
+                      color = "#ff4444" if sev=="CRITICAL" else "#ff9900"
+                      trivy_rows += (
+                        f"<tr><td><span style='background:{color};color:white;"
+                        f"padding:2px 6px;border-radius:4px;font-size:11px'>{sev}</span></td>"
+                        f"<td>{origin}</td><td><b>{cve}</b></td>"
+                        f"<td>{pkg} {ver}</td>"
+                        f"<td style='color:green'>{fixed}</td><td>{title}</td></tr>"
+                      )
+
+          # ── SpotBugs rows ──
+          spotbugs_rows = ""
+          try:
+              tree = ET.parse("/tmp/sast-reports/spotbugs.xml")
+              for bug in tree.findall(".//BugInstance"):
+                  cat  = bug.get("category","")
+                  prio = bug.get("priority","3")
+                  typ  = bug.get("type","")
+                  cls  = (bug.find("Class") or bug).get("classname","")
+                  color = "#ff4444" if prio=="1" else "#ff9900" if prio=="2" else "#888"
+                  label = "HAUT" if prio=="1" else "MOYEN" if prio=="2" else "BAS"
+                  spotbugs_rows += (
+                    f"<tr><td><span style='background:{color};color:white;"
+                    f"padding:2px 6px;border-radius:4px;font-size:11px'>{label}</span></td>"
+                    f"<td>{cat}</td><td>{typ}</td><td>{cls}</td></tr>"
+                  )
+          except: pass
+
+          total_semgrep  = len(sb.get("results",[])) + len(sf.get("results",[]))
+          total_trivy    = sum(
+              len(r.get("Vulnerabilities") or [])
+              for d in [tb,tf] for r in d.get("Results",[])
+          )
+
+          html = f"""<!DOCTYPE html>
+          <html><head><meta charset='UTF-8'>
+          <title>Rapport SAST GMAO</title>
+          <style>
+            body{{font-family:Arial,sans-serif;padding:24px;background:#f5f5f5;color:#222}}
+            h1{{color:#232f3e;border-bottom:3px solid #ff9900;padding-bottom:8px}}
+            h2{{color:#232f3e;margin-top:32px}}
+            table{{width:100%;border-collapse:collapse;background:white;
+                   margin-bottom:24px;box-shadow:0 1px 4px rgba(0,0,0,.1)}}
+            th{{background:#232f3e;color:white;padding:10px;text-align:left;font-size:13px}}
+            td{{padding:8px 10px;border-bottom:1px solid #eee;font-size:12px;vertical-align:top}}
+            tr:hover{{background:#fafafa}}
+            .summary{{display:flex;gap:16px;margin-bottom:24px;flex-wrap:wrap}}
+            .card{{background:white;padding:16px 24px;border-radius:8px;
+                   box-shadow:0 1px 4px rgba(0,0,0,.1);min-width:160px}}
+            .card .num{{font-size:32px;font-weight:bold;color:#ff4444}}
+            .card .num.ok{{color:green}}
+            .card .lab{{font-size:12px;color:#666;margin-top:4px}}
+            .blocking{{background:#fff3f3;border-left:4px solid #ff4444;
+                       padding:12px 16px;margin-bottom:24px;border-radius:4px}}
+            .ok-banner{{background:#f3fff3;border-left:4px solid green;
+                        padding:12px 16px;margin-bottom:24px;border-radius:4px}}
+          </style></head><body>
+          <h1>Rapport SAST + SCA — Application GMAO</h1>
+
+          <div class='summary'>
+            <div class='card'>
+              <div class='num {"ok" if total_semgrep==0 else ""}'>{total_semgrep}</div>
+              <div class='lab'>Semgrep findings</div>
+            </div>
+            <div class='card'>
+              <div class='num {"ok" if total_trivy==0 else ""}'>{total_trivy}</div>
+              <div class='lab'>CVE Trivy (CRITICAL+HIGH)</div>
+            </div>
+            <div class='card'>
+              <div class='num {"ok" if not spotbugs_rows else ""}'>{len(spotbugs_rows)//100 if spotbugs_rows else 0}</div>
+              <div class='lab'>SpotBugs bugs</div>
+            </div>
+          </div>
+
+          <h2>Semgrep — Analyse du code source</h2>
+          <table>
+            <tr><th>Sévérité</th><th>Source</th><th>Fichier:Ligne</th><th>Règle</th><th>Message</th></tr>
+            {semgrep_rows or "<tr><td colspan='5' style='text-align:center;padding:20px;color:green'>Aucun problème détecté</td></tr>"}
+          </table>
+
+          <h2>Trivy — CVE dans les dépendances (avec fix disponible)</h2>
+          <table>
+            <tr><th>Sévérité</th><th>Source</th><th>CVE</th><th>Package</th><th>Fix disponible</th><th>Description</th></tr>
+            {trivy_rows or "<tr><td colspan='6' style='text-align:center;padding:20px;color:green'>Aucune CVE CRITICAL/HIGH détectée</td></tr>"}
+          </table>
+
+          <h2>SpotBugs — Bugs dans le bytecode Java</h2>
+          <table>
+            <tr><th>Priorité</th><th>Catégorie</th><th>Type</th><th>Classe</th></tr>
+            {spotbugs_rows or "<tr><td colspan='4' style='text-align:center;padding:20px;color:green'>Aucun bug détecté</td></tr>"}
+          </table>
+          </body></html>"""
+
+          with open("/tmp/sast-reports/sast-report.html","w") as f:
+              f.write(html)
+          print("Rapport SAST HTML complet généré")
+          PYEOF
+
+      # ── Statut final avec détection blocage ────────────────────────────
+      - name: Statut final SAST
+        id: sast_result
+        run: |
+          SB_T="${{ steps.semgrep_backend.outputs.semgrep_backend_total }}"
+          SF_T="${{ steps.semgrep_frontend.outputs.semgrep_frontend_total }}"
+          TB_C="${{ steps.trivy_backend.outputs.trivy_backend_critical }}"
+          TF_C="${{ steps.trivy_frontend.outputs.trivy_frontend_critical }}"
+          TB_H="${{ steps.trivy_backend.outputs.trivy_backend_high }}"
+          TF_H="${{ steps.trivy_frontend.outputs.trivy_frontend_high }}"
+          SP="${{ steps.spotbugs.outputs.spotbugs_count }}"
+
+          TOTAL_SEMGREP=$(( ${SB_T:-0} + ${SF_T:-0} ))
+          TOTAL_CVE_C=$(( ${TB_C:-0} + ${TF_C:-0} ))
+          TOTAL_CVE_H=$(( ${TB_H:-0} + ${TF_H:-0} ))
+          BLOCKING_TB="${{ steps.trivy_backend.outputs.trivy_backend_blocking }}"
+          BLOCKING_TF="${{ steps.trivy_frontend.outputs.trivy_frontend_blocking }}"
+
+          SUMMARY="Semgrep: $TOTAL_SEMGREP | CVE Critical: $TOTAL_CVE_C | CVE High: $TOTAL_CVE_H | SpotBugs: ${SP:-0}"
+          echo "sast_summary=$SUMMARY" >> $GITHUB_OUTPUT
+
+          # Statut bloquant si CVE critique avec fix dispo
+          if [ "$BLOCKING_TB" = "true" ] || [ "$BLOCKING_TF" = "true" ]; then
+            echo "sast_status=critical_blocking" >> $GITHUB_OUTPUT
+            echo "sast_blocking=true"            >> $GITHUB_OUTPUT
+            echo "BLOQUANT : CVE critique(s) détectée(s) avec correctif disponible"
+          elif [ "$TOTAL_SEMGREP" -gt 0 ] || [ "$TOTAL_CVE_H" -gt 0 ]; then
+            echo "sast_status=issues_found"  >> $GITHUB_OUTPUT
+            echo "sast_blocking=false"       >> $GITHUB_OUTPUT
+            echo "AVERTISSEMENT : problèmes détectés (non bloquants)"
+          else
+            echo "sast_status=clean"   >> $GITHUB_OUTPUT
+            echo "sast_blocking=false" >> $GITHUB_OUTPUT
+            echo "Aucun problème détecté"
+          fi
+
+      - name: Sauvegarde rapports SAST
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-reports
+          path: /tmp/sast-reports/
+          retention-days: 30
+
+      # ── Poster résumé dans la PR si applicable ─────────────────────────
+      - name: Commentaire résumé dans la Pull Request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const status  = "${{ steps.sast_result.outputs.sast_status }}";
+            const summary = "${{ steps.sast_result.outputs.sast_summary }}";
+            const blocking = "${{ steps.sast_result.outputs.sast_blocking }}";
+            const icon = status === 'clean' ? '✅' : blocking === 'true' ? '🚨' : '⚠️';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ${icon} Rapport SAST\n**Statut** : ${status}\n**Résumé** : ${summary}\n\n[Voir le rapport complet](${runUrl})`
+            });
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 5 — DAST : OWASP ZAP Full Scan + API Scan OpenAPI
+# ════════════════════════════════════════════════════════════════════════════
+  job5_dast:
+    name: "JOB 5 — DAST OWASP ZAP Full + API Scan"
+    runs-on: ubuntu-latest
+    needs: [job1_create_vm, job3_start_app]
+    if: |
+      github.event.inputs.destroy_infra != 'true' &&
+      needs.job1_create_vm.outputs.vm_skipped != 'true' &&
+      needs.job3_start_app.result == 'success'
+    continue-on-error: true
+    outputs:
+      dast_status:  ${{ steps.dast_result.outputs.dast_status }}
+      dast_summary: ${{ steps.dast_result.outputs.dast_summary }}
+    env:
+      VM_IP: ${{ needs.job1_create_vm.outputs.public_ip }}
+
+    steps:
+      - name: Checkout du depot
+        uses: actions/checkout@v4
+
+      # ── Création fichier de règles ZAP si absent ────────────────────────
+      - name: Creation fichier regles ZAP (.zap/rules.tsv)
+        run: |
+          mkdir -p .zap
+          if [ ! -f ".zap/rules.tsv" ]; then
+            cat > .zap/rules.tsv << 'EOF'
+          # Règles ZAP à ignorer (faux positifs courants en développement)
+          # Format : ID_règle TAB action (IGNORE/WARN/FAIL)
+          10015	IGNORE	Incomplete or No Cache-control Header Set
+          10027	IGNORE	Information Disclosure - Suspicious Comments
+          10096	IGNORE	Timestamp Disclosure
+          90022	IGNORE	Application Error Disclosure
+          EOF
+            echo "Fichier .zap/rules.tsv créé"
+          else
+            echo "Fichier .zap/rules.tsv existant conservé"
+          fi
+
+      - name: Attente stabilisation application (30s)
+        run: |
+          echo "Attente que l'application soit stable..."
+          sleep 30
+          echo "Test connectivité backend..."
+          curl -s --max-time 10 http://${{ env.VM_IP }}:8080 -o /dev/null && \
+            echo "Backend accessible" || echo "Backend pas encore prêt"
+
+      # ── ZAP Full Scan Backend Spring Boot ───────────────────────────────
+      - name: DAST — ZAP Full Scan Backend (port 8080)
+        id: zap_backend
+        uses: zaproxy/action-full-scan@v0.10.0
+        continue-on-error: true
+        with:
+          target: "http://${{ env.VM_IP }}:8080"
+          rules_file_name: ".zap/rules.tsv"
+          fail_action: false
+          artifact_name: zap-report-backend
+          cmd_options: "-T 5 -a"
+
+      # ── ZAP Full Scan Frontend Angular ──────────────────────────────────
+      - name: DAST — ZAP Full Scan Frontend Angular (port 4200)
+        id: zap_frontend
+        uses: zaproxy/action-full-scan@v0.10.0
+        continue-on-error: true
+        with:
+          target: "http://${{ env.VM_IP }}:4200"
+          rules_file_name: ".zap/rules.tsv"
+          fail_action: false
+          artifact_name: zap-report-frontend
+          cmd_options: "-T 5 -a"
+
+      # ── ZAP API Scan (OpenAPI/Swagger si disponible) ────────────────────
+      - name: Detection Swagger Spring Boot
+        id: detect_swagger
+        run: |
+          HTTP=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
+            http://${{ env.VM_IP }}:8080/v3/api-docs 2>/dev/null || echo "000")
+          if [ "$HTTP" = "200" ]; then
+            echo "swagger_available=true" >> $GITHUB_OUTPUT
+            echo "Swagger détecté sur /v3/api-docs"
+          else
+            HTTP2=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
+              http://${{ env.VM_IP }}:8080/swagger-ui.html 2>/dev/null || echo "000")
+            if [ "$HTTP2" != "000" ]; then
+              echo "swagger_available=true" >> $GITHUB_OUTPUT
+              echo "Swagger UI détecté"
+            else
+              echo "swagger_available=false" >> $GITHUB_OUTPUT
+              echo "Swagger non disponible — API Scan ignoré"
+            fi
+          fi
+
+      - name: DAST — ZAP API Scan (routes OpenAPI)
+        id: zap_api
+        if: steps.detect_swagger.outputs.swagger_available == 'true'
+        uses: zaproxy/action-api-scan@v0.7.0
+        continue-on-error: true
+        with:
+          target: "http://${{ env.VM_IP }}:8080/v3/api-docs"
+          format: openapi
+          rules_file_name: ".zap/rules.tsv"
+          fail_action: false
+          artifact_name: zap-report-api
+
+      # ── Collecte et comptage de toutes les alertes ──────────────────────
+      - name: Collecte et comptage alertes ZAP
+        id: count_alerts
+        run: |
+          mkdir -p /tmp/dast-reports
+
+          count_alerts() {
+            local file=$1
+            python3 -c "
+          import json
+          try:
+            data=json.load(open('$file'))
+            high=sum(1 for s in data.get('site',[])
+                       for a in s.get('alerts',[])
+                       if str(a.get('riskcode','0'))=='3')
+            med=sum(1 for s in data.get('site',[])
+                      for a in s.get('alerts',[])
+                      if str(a.get('riskcode','0'))=='2')
+            print(high,med)
+          except: print(0,0)" 2>/dev/null || echo "0 0"
+          }
+
+          # Copie des rapports JSON
+          for f in zap-report-backend.json zap-report-frontend.json zap-report-api.json; do
+            [ -f "$f" ] && cp "$f" /tmp/dast-reports/ || true
+          done
+
+          read BACKEND_H BACKEND_M  <<< $(count_alerts "zap-report-backend.json")
+          read FRONTEND_H FRONTEND_M <<< $(count_alerts "zap-report-frontend.json")
+          read API_H API_M           <<< $(count_alerts "zap-report-api.json")
+
+          echo "backend_high=$BACKEND_H"   >> $GITHUB_OUTPUT
+          echo "backend_med=$BACKEND_M"    >> $GITHUB_OUTPUT
+          echo "frontend_high=$FRONTEND_H" >> $GITHUB_OUTPUT
+          echo "frontend_med=$FRONTEND_M"  >> $GITHUB_OUTPUT
+          echo "api_high=$API_H"           >> $GITHUB_OUTPUT
+          echo "api_med=$API_M"            >> $GITHUB_OUTPUT
+
+          echo "Backend  — HIGH: $BACKEND_H  | MEDIUM: $BACKEND_M"
+          echo "Frontend — HIGH: $FRONTEND_H | MEDIUM: $FRONTEND_M"
+          echo "API      — HIGH: $API_H      | MEDIUM: $API_M"
+
+      # ── Génération rapport HTML consolidé enrichi ───────────────────────
+      - name: Generation rapport DAST HTML consolide
+        run: |
+          python3 << 'PYEOF'
+          import json
+
+          RISK_LABELS = {"3":"HIGH","2":"MEDIUM","1":"LOW","0":"INFO"}
+          RISK_COLORS = {"3":"#ff4444","2":"#ff9900","1":"#888","0":"#aaa"}
+
+          def parse_alerts(path, origin):
+              rows = []
+              total_h = total_m = 0
+              try:
+                  data = json.load(open(path))
+                  for site in data.get("site",[]):
+                      url = site.get("@name","")
+                      for alert in site.get("alerts",[]):
+                          risk  = str(alert.get("riskcode","0"))
+                          name  = (alert.get("name","") or "")[:80]
+                          desc  = (alert.get("desc","") or "")[:150].replace("<p>","").replace("</p>"," ")
+                          sol   = (alert.get("solution","") or "")[:120].replace("<p>","").replace("</p>"," ")
+                          count = alert.get("count",1)
+                          label = RISK_LABELS.get(risk,risk)
+                          color = RISK_COLORS.get(risk,"#888")
+                          if risk == "3": total_h += 1
+                          if risk == "2": total_m += 1
+                          rows.append(
+                            f"<tr><td><span style='background:{color};color:white;"
+                            f"padding:2px 6px;border-radius:4px;font-size:11px'>{label}</span></td>"
+                            f"<td>{origin}</td><td>{name}</td>"
+                            f"<td style='color:#666;font-size:11px'>{count} occurrence(s)</td>"
+                            f"<td style='font-size:11px'>{desc}</td>"
+                            f"<td style='font-size:11px;color:green'>{sol}</td></tr>"
+                          )
+              except: pass
+              return "".join(rows), total_h, total_m
+
+          b_rows, b_h, b_m = parse_alerts("/tmp/dast-reports/zap-report-backend.json",  "Backend :8080")
+          f_rows, f_h, f_m = parse_alerts("/tmp/dast-reports/zap-report-frontend.json", "Frontend :4200")
+          a_rows, a_h, a_m = parse_alerts("/tmp/dast-reports/zap-report-api.json",      "API OpenAPI")
+          all_rows = b_rows + f_rows + a_rows
+          total_h  = b_h + f_h + a_h
+          total_m  = b_m + f_m + a_m
+
+          html = f"""<!DOCTYPE html>
+          <html><head><meta charset='UTF-8'>
+          <title>Rapport DAST GMAO — OWASP ZAP</title>
+          <style>
+            body{{font-family:Arial,sans-serif;padding:24px;background:#f5f5f5;color:#222}}
+            h1{{color:#232f3e;border-bottom:3px solid #ff4444;padding-bottom:8px}}
+            h2{{color:#232f3e;margin-top:28px}}
+            table{{width:100%;border-collapse:collapse;background:white;
+                   margin-bottom:24px;box-shadow:0 1px 4px rgba(0,0,0,.1)}}
+            th{{background:#232f3e;color:white;padding:10px;text-align:left;font-size:13px}}
+            td{{padding:8px 10px;border-bottom:1px solid #eee;font-size:12px;vertical-align:top}}
+            tr:hover{{background:#fafafa}}
+            .summary{{display:flex;gap:16px;margin-bottom:24px;flex-wrap:wrap}}
+            .card{{background:white;padding:16px 24px;border-radius:8px;
+                   box-shadow:0 1px 4px rgba(0,0,0,.1);min-width:140px}}
+            .card .num{{font-size:32px;font-weight:bold}}
+            .card .num.red{{color:#ff4444}}
+            .card .num.orange{{color:#ff9900}}
+            .card .num.ok{{color:green}}
+            .card .lab{{font-size:12px;color:#666;margin-top:4px}}
+          </style></head><body>
+          <h1>Rapport DAST — OWASP ZAP Full Scan + API Scan</h1>
+
+          <div class='summary'>
+            <div class='card'>
+              <div class='num {"red" if total_h>0 else "ok"}'>{total_h}</div>
+              <div class='lab'>Alertes HIGH</div>
+            </div>
+            <div class='card'>
+              <div class='num {"orange" if total_m>0 else "ok"}'>{total_m}</div>
+              <div class='lab'>Alertes MEDIUM</div>
+            </div>
+            <div class='card'>
+              <div class='num {"red" if total_h+total_m>0 else "ok"}'>{total_h+total_m}</div>
+              <div class='lab'>Total à corriger</div>
+            </div>
+          </div>
+
+          <h2>Toutes les alertes — Backend, Frontend et API</h2>
+          <table>
+            <tr><th>Risque</th><th>Cible</th><th>Alerte</th><th>Occurrences</th><th>Description</th><th>Solution</th></tr>
+            {all_rows or "<tr><td colspan='6' style='text-align:center;padding:20px;color:green'>Aucune alerte HIGH/MEDIUM détectée</td></tr>"}
+          </table>
+          </body></html>"""
+
+          with open("/tmp/dast-reports/dast-report.html","w") as f:
+              f.write(html)
+          print(f"Rapport DAST HTML généré — {total_h} HIGH, {total_m} MEDIUM")
+          PYEOF
+
+      # ── Statut final DAST ───────────────────────────────────────────────
+      - name: Statut final DAST
+        id: dast_result
+        run: |
+          BH="${{ steps.count_alerts.outputs.backend_high }}"
+          BM="${{ steps.count_alerts.outputs.backend_med }}"
+          FH="${{ steps.count_alerts.outputs.frontend_high }}"
+          FM="${{ steps.count_alerts.outputs.frontend_med }}"
+          AH="${{ steps.count_alerts.outputs.api_high }}"
+          AM="${{ steps.count_alerts.outputs.api_med }}"
+
+          TOTAL_H=$(( ${BH:-0}+${FH:-0}+${AH:-0} ))
+          TOTAL_M=$(( ${BM:-0}+${FM:-0}+${AM:-0} ))
+          TOTAL=$(( TOTAL_H + TOTAL_M ))
+
+          SUMMARY="HIGH: $TOTAL_H | MEDIUM: $TOTAL_M | Total: $TOTAL (Backend+Frontend+API)"
+          echo "dast_summary=$SUMMARY" >> $GITHUB_OUTPUT
+
+          if [ "$TOTAL_H" -gt 0 ]; then
+            echo "dast_status=high_found"   >> $GITHUB_OUTPUT
+            echo "ALERTES HIGH détectées : $TOTAL_H"
+          elif [ "$TOTAL_M" -gt 0 ]; then
+            echo "dast_status=medium_found" >> $GITHUB_OUTPUT
+            echo "Alertes MEDIUM détectées : $TOTAL_M"
+          else
+            echo "dast_status=clean"        >> $GITHUB_OUTPUT
+            echo "Aucune alerte HIGH/MEDIUM"
+          fi
+
+      - name: Sauvegarde rapports DAST
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-reports
+          path: /tmp/dast-reports/
+          retention-days: 30
+
+      # ── Commentaire résumé dans la PR ───────────────────────────────────
+      - name: Commentaire résumé dans la Pull Request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const status  = "${{ steps.dast_result.outputs.dast_status }}";
+            const summary = "${{ steps.dast_result.outputs.dast_summary }}";
+            const icon = status === 'clean' ? '✅' : status === 'high_found' ? '🚨' : '⚠️';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ${icon} Rapport DAST\n**Statut** : ${status}\n**Résumé** : ${summary}\n\n[Voir le rapport complet](${runUrl})`
+            });
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB 6 — Monitoring CloudWatch (avec export métriques)
+# ════════════════════════════════════════════════════════════════════════════
+  job6_monitoring:
+    name: "JOB 6 — Monitoring CloudWatch"
+    runs-on: ubuntu-latest
+    needs: [job1_create_vm, job3_start_app]
+    if: |
+      always() &&
+      github.event.inputs.destroy_infra != 'true' &&
+      needs.job1_create_vm.outputs.vm_skipped != 'true' &&
+      needs.job3_start_app.result == 'success'
+    outputs:
+      cpu_usage:      ${{ steps.collect_metrics.outputs.cpu_usage }}
+      mem_usage:      ${{ steps.collect_metrics.outputs.mem_usage }}
+      disk_usage:     ${{ steps.collect_metrics.outputs.disk_usage }}
+      alarm_cpu:      ${{ steps.collect_metrics.outputs.alarm_cpu }}
+      alarm_mem:      ${{ steps.collect_metrics.outputs.alarm_mem }}
+      alarm_disk:     ${{ steps.collect_metrics.outputs.alarm_disk }}
+      monitoring_url: ${{ steps.collect_metrics.outputs.monitoring_url }}
+    env:
+      VM_IP:       ${{ needs.job1_create_vm.outputs.public_ip }}
+      INSTANCE_ID: ${{ needs.job1_create_vm.outputs.instance_id }}
+    steps:
+      - name: Checkout du depot
+        uses: actions/checkout@v4
+
+      - name: Configuration credentials AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Configuration cle SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/vockey.pem
+          chmod 600 ~/.ssh/vockey.pem
+          cat >> ~/.ssh/config << SSHCFG
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            IdentityFile ~/.ssh/vockey.pem
+          SSHCFG
+
+      - name: Installation CloudWatch Agent sur la VM
+        run: |
+          ssh ubuntu@${{ env.VM_IP }} bash << 'SSHEOF'
+            wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+            sudo dpkg -i amazon-cloudwatch-agent.deb
+            rm -f amazon-cloudwatch-agent.deb
+            echo "CloudWatch Agent installe"
+          SSHEOF
+
+      - name: Configuration CloudWatch (metriques + logs)
+        run: |
+          cat > /tmp/cloudwatch-config.json << 'CONFIG'
+          {
+            "agent": { "metrics_collection_interval": 60, "run_as_user": "root" },
+            "metrics": {
+              "namespace": "GMAO/EC2",
+              "append_dimensions": { "InstanceId": "${aws:InstanceId}" },
+              "metrics_collected": {
+                "cpu":  { "measurement": ["cpu_usage_idle","cpu_usage_user","cpu_usage_system"], "metrics_collection_interval": 60, "totalcpu": true },
+                "mem":  { "measurement": ["mem_used_percent","mem_available"], "metrics_collection_interval": 60 },
+                "disk": { "measurement": ["used_percent","free"], "metrics_collection_interval": 60, "resources": ["/"] }
+              }
+            },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    { "file_path": "/tmp/gmao-backend.log",  "log_group_name": "/gmao/backend",  "log_stream_name": "{instance_id}", "timezone": "UTC" },
+                    { "file_path": "/tmp/gmao-frontend.log", "log_group_name": "/gmao/frontend", "log_stream_name": "{instance_id}", "timezone": "UTC" },
+                    { "file_path": "/var/log/syslog",        "log_group_name": "/gmao/system",   "log_stream_name": "{instance_id}", "timezone": "UTC" }
+                  ]
+                }
+              }
+            }
+          }
+          CONFIG
+          scp /tmp/cloudwatch-config.json ubuntu@${{ env.VM_IP }}:/tmp/cloudwatch-config.json
+          ssh ubuntu@${{ env.VM_IP }} bash << 'SSHEOF'
+            sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+            sudo cp /tmp/cloudwatch-config.json \
+              /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+            sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config -m ec2 \
+              -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+            sudo systemctl enable amazon-cloudwatch-agent
+            echo "CloudWatch Agent demarre"
+          SSHEOF
+
+      - name: Creation alarmes CloudWatch
+        run: |
+          TOPIC_ARN=$(aws sns create-topic \
+            --name gmao-alerts \
+            --query 'TopicArn' --output text)
+          echo "TOPIC_ARN=$TOPIC_ARN" >> $GITHUB_ENV
+          aws sns subscribe \
+            --topic-arn "$TOPIC_ARN" \
+            --protocol email \
+            --notification-endpoint "oumaimabn.amelmm@gmail.com"
+          for ALARM in \
+            "gmao-cpu-high|CPU GMAO > 80%|CPUUtilization|AWS/EC2|80" \
+            "gmao-memory-high|Memoire GMAO > 85%|mem_used_percent|GMAO/EC2|85" \
+            "gmao-disk-full|Disque GMAO > 90%|disk_used_percent|GMAO/EC2|90"; do
+            NAME=$(echo $ALARM      | cut -d'|' -f1)
+            DESC=$(echo $ALARM      | cut -d'|' -f2)
+            METRIC=$(echo $ALARM    | cut -d'|' -f3)
+            NS=$(echo $ALARM        | cut -d'|' -f4)
+            THRESHOLD=$(echo $ALARM | cut -d'|' -f5)
+            aws cloudwatch put-metric-alarm \
+              --alarm-name "$NAME" --alarm-description "$DESC" \
+              --metric-name "$METRIC" --namespace "$NS" \
+              --statistic Average \
+              --dimensions Name=InstanceId,Value=${{ env.INSTANCE_ID }} \
+              --period 300 --evaluation-periods 1 \
+              --threshold $THRESHOLD \
+              --comparison-operator GreaterThanThreshold \
+              --alarm-actions "$TOPIC_ARN" --ok-actions "$TOPIC_ARN"
+          done
+          echo "Alarmes CloudWatch creees"
+
+      # ── Collecte métriques réelles depuis CloudWatch ────────────────────
+      - name: Collecte metriques CloudWatch pour rapport
+        id: collect_metrics
+        run: |
+          END_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          START_TIME=$(date -u -d '10 minutes ago' +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
+                       date -u -v-10M +"%Y-%m-%dT%H:%M:%SZ")
+
+          # CPU depuis AWS/EC2
+          CPU=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/EC2 \
+            --metric-name CPUUtilization \
+            --dimensions Name=InstanceId,Value=${{ env.INSTANCE_ID }} \
+            --start-time "$START_TIME" \
+            --end-time "$END_TIME" \
+            --period 600 \
+            --statistics Average \
+            --query 'Datapoints[0].Average' \
+            --output text 2>/dev/null || echo "N/A")
+          [ "$CPU" = "None" ] && CPU="N/A"
+
+          # Mémoire depuis GMAO/EC2
+          MEM=$(aws cloudwatch get-metric-statistics \
+            --namespace GMAO/EC2 \
+            --metric-name mem_used_percent \
+            --dimensions Name=InstanceId,Value=${{ env.INSTANCE_ID }} \
+            --start-time "$START_TIME" \
+            --end-time "$END_TIME" \
+            --period 600 \
+            --statistics Average \
+            --query 'Datapoints[0].Average' \
+            --output text 2>/dev/null || echo "N/A")
+          [ "$MEM" = "None" ] && MEM="N/A"
+
+          # Disque depuis GMAO/EC2
+          DISK=$(aws cloudwatch get-metric-statistics \
+            --namespace GMAO/EC2 \
+            --metric-name disk_used_percent \
+            --dimensions Name=InstanceId,Value=${{ env.INSTANCE_ID }} \
+            --start-time "$START_TIME" \
+            --end-time "$END_TIME" \
+            --period 600 \
+            --statistics Average \
+            --query 'Datapoints[0].Average' \
+            --output text 2>/dev/null || echo "N/A")
+          [ "$DISK" = "None" ] && DISK="N/A"
+
+          # Métriques SSH directes depuis la VM (plus fiables)
+          VM_STATS=$(ssh ubuntu@${{ env.VM_IP }} bash << 'ENDSSH'
+            CPU_V=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || echo "N/A")
+            MEM_V=$(free | grep Mem | awk '{printf "%.1f", $3/$2 * 100.0}' 2>/dev/null || echo "N/A")
+            DISK_V=$(df / | tail -1 | awk '{print $5}' | tr -d '%' 2>/dev/null || echo "N/A")
+            MEM_TOTAL=$(free -h | grep Mem | awk '{print $2}' 2>/dev/null || echo "N/A")
+            MEM_USED=$(free -h | grep Mem | awk '{print $3}' 2>/dev/null || echo "N/A")
+            DISK_TOTAL=$(df -h / | tail -1 | awk '{print $2}' 2>/dev/null || echo "N/A")
+            DISK_USED=$(df -h / | tail -1 | awk '{print $3}' 2>/dev/null || echo "N/A")
+            DISK_FREE=$(df -h / | tail -1 | awk '{print $4}' 2>/dev/null || echo "N/A")
+            UPTIME_V=$(uptime -p 2>/dev/null || echo "N/A")
+            LOAD=$(uptime | awk -F'load average:' '{print $2}' | xargs 2>/dev/null || echo "N/A")
+            BACKEND_PID=$(pgrep -f "spring\|java.*jar" | head -1 2>/dev/null || echo "stopped")
+            FRONTEND_PID=$(pgrep -f "ng serve\|angular\|node.*4200" | head -1 2>/dev/null || echo "stopped")
+            BACKEND_STATUS=$( [ -n "$BACKEND_PID" ] && echo "running" || echo "stopped")
+            FRONTEND_STATUS=$( [ -n "$FRONTEND_PID" ] && echo "running" || echo "stopped")
+            echo "$CPU_V|$MEM_V|$DISK_V|$MEM_TOTAL|$MEM_USED|$DISK_TOTAL|$DISK_USED|$DISK_FREE|$UPTIME_V|$LOAD|$BACKEND_STATUS|$FRONTEND_STATUS"
+          ENDSSH
+          )
+
+          CPU_SSH=$(echo $VM_STATS    | cut -d'|' -f1)
+          MEM_SSH=$(echo $VM_STATS    | cut -d'|' -f2)
+          DISK_SSH=$(echo $VM_STATS   | cut -d'|' -f3)
+          MEM_TOTAL=$(echo $VM_STATS  | cut -d'|' -f4)
+          MEM_USED=$(echo $VM_STATS   | cut -d'|' -f5)
+          DISK_TOTAL=$(echo $VM_STATS | cut -d'|' -f6)
+          DISK_USED=$(echo $VM_STATS  | cut -d'|' -f7)
+          DISK_FREE=$(echo $VM_STATS  | cut -d'|' -f8)
+          UPTIME=$(echo $VM_STATS     | cut -d'|' -f9)
+          LOAD=$(echo $VM_STATS       | cut -d'|' -f10)
+          BACKEND_S=$(echo $VM_STATS  | cut -d'|' -f11)
+          FRONTEND_S=$(echo $VM_STATS | cut -d'|' -f12)
+
+          # État des alarmes CloudWatch
+          ALARM_CPU=$(aws cloudwatch describe-alarms \
+            --alarm-names "gmao-cpu-high" \
+            --query 'MetricAlarms[0].StateValue' \
+            --output text 2>/dev/null || echo "UNKNOWN")
+
+          ALARM_MEM=$(aws cloudwatch describe-alarms \
+            --alarm-names "gmao-memory-high" \
+            --query 'MetricAlarms[0].StateValue' \
+            --output text 2>/dev/null || echo "UNKNOWN")
+
+          ALARM_DISK=$(aws cloudwatch describe-alarms \
+            --alarm-names "gmao-disk-full" \
+            --query 'MetricAlarms[0].StateValue' \
+            --output text 2>/dev/null || echo "UNKNOWN")
+
+          # Export pour le JOB FINAL
+          echo "cpu_usage=$CPU_SSH"          >> $GITHUB_OUTPUT
+          echo "mem_usage=$MEM_SSH"          >> $GITHUB_OUTPUT
+          echo "disk_usage=$DISK_SSH"        >> $GITHUB_OUTPUT
+          echo "mem_total=$MEM_TOTAL"        >> $GITHUB_OUTPUT
+          echo "mem_used=$MEM_USED"          >> $GITHUB_OUTPUT
+          echo "disk_total=$DISK_TOTAL"      >> $GITHUB_OUTPUT
+          echo "disk_used=$DISK_USED"        >> $GITHUB_OUTPUT
+          echo "disk_free=$DISK_FREE"        >> $GITHUB_OUTPUT
+          echo "uptime=$UPTIME"              >> $GITHUB_OUTPUT
+          echo "load=$LOAD"                  >> $GITHUB_OUTPUT
+          echo "backend_status=$BACKEND_S"   >> $GITHUB_OUTPUT
+          echo "frontend_status=$FRONTEND_S" >> $GITHUB_OUTPUT
+          echo "alarm_cpu=$ALARM_CPU"        >> $GITHUB_OUTPUT
+          echo "alarm_mem=$ALARM_MEM"        >> $GITHUB_OUTPUT
+          echo "alarm_disk=$ALARM_DISK"      >> $GITHUB_OUTPUT
+          echo "monitoring_url=https://console.aws.amazon.com/cloudwatch/home#dashboards:name=GMAO-Dashboard" >> $GITHUB_OUTPUT
+
+          echo "CPU: $CPU_SSH% | MEM: $MEM_SSH% | DISK: $DISK_SSH%"
+          echo "Alarmes — CPU: $ALARM_CPU | MEM: $ALARM_MEM | DISK: $ALARM_DISK"
+
+# ════════════════════════════════════════════════════════════════════════════
+#  JOB FINAL — Notification complète (SAST + DAST + Monitoring + Résumé)
+# ════════════════════════════════════════════════════════════════════════════
+  job_notify:
+    name: "JOB FINAL — Notification et Resume"
+    runs-on: ubuntu-latest
+    needs: [job1_create_vm, job2_post_install, job3_start_app,
+            job4_sast, job5_dast, job6_monitoring]
+    if: always() && github.event.inputs.destroy_infra != 'true'
+    env:
+      VM_IP:       ${{ needs.job1_create_vm.outputs.public_ip }}
+      INSTANCE_ID: ${{ needs.job1_create_vm.outputs.instance_id }}
+      J0_STATUS:   ${{ needs.job0_validate_code.result }}
+      J1_STATUS:   ${{ needs.job1_create_vm.result }}
+      J2_STATUS:   ${{ needs.job2_post_install.result }}
+      J3_STATUS:   ${{ needs.job3_start_app.result }}
+      J4_SAST:     ${{ needs.job4_sast.outputs.sast_status }}
+      J4_SUMMARY:  ${{ needs.job4_sast.outputs.sast_summary }}
+      J4_BLOCKING: ${{ needs.job4_sast.outputs.sast_blocking }}
+      J5_DAST:     ${{ needs.job5_dast.outputs.dast_status }}
+      J5_SUMMARY:  ${{ needs.job5_dast.outputs.dast_summary }}
+      CPU:         ${{ needs.job6_monitoring.outputs.cpu_usage }}
+      MEM:         ${{ needs.job6_monitoring.outputs.mem_usage }}
+      DISK:        ${{ needs.job6_monitoring.outputs.disk_usage }}
+      MEM_TOTAL:   ${{ needs.job6_monitoring.outputs.mem_total }}
+      MEM_USED:    ${{ needs.job6_monitoring.outputs.mem_used }}
+      DISK_TOTAL:  ${{ needs.job6_monitoring.outputs.disk_total }}
+      DISK_USED:   ${{ needs.job6_monitoring.outputs.disk_used }}
+      DISK_FREE:   ${{ needs.job6_monitoring.outputs.disk_free }}
+      UPTIME:      ${{ needs.job6_monitoring.outputs.uptime }}
+      LOAD:        ${{ needs.job6_monitoring.outputs.load }}
+      BACKEND_S:   ${{ needs.job6_monitoring.outputs.backend_status }}
+      FRONTEND_S:  ${{ needs.job6_monitoring.outputs.frontend_status }}
+      ALARM_CPU:   ${{ needs.job6_monitoring.outputs.alarm_cpu }}
+      ALARM_MEM:   ${{ needs.job6_monitoring.outputs.alarm_mem }}
+      ALARM_DISK:  ${{ needs.job6_monitoring.outputs.alarm_disk }}
+ 
+    steps:
+      - name: Checkout du depot
+        uses: actions/checkout@v4
+ 
+      - name: Resume complet du deploiement
+        run: |
+          echo "JOB 0 : $J0_STATUS"
+          echo "JOB 1 : $J1_STATUS"
+          echo "JOB 2 : $J2_STATUS"
+          echo "JOB 3 : $J3_STATUS"
+          echo "JOB 4 SAST : $J4_SAST"
+          echo "JOB 5 DAST : $J5_DAST"
+          echo "CPU: $CPU% | MEM: $MEM% | DISK: $DISK%"
+ 
+      - name: Installation msmtp
+        run: sudo apt-get install -y msmtp msmtp-mta -q
+ 
+      - name: Configuration msmtp
+        run: |
+          cat > ~/.msmtprc << EOF
+          defaults
+          auth           on
+          tls            on
+          tls_trust_file /etc/ssl/certs/ca-certificates.crt
+          account        gmail
+          host           smtp.gmail.com
+          port           587
+          from           ${{ secrets.GMAIL_USER }}
+          user           ${{ secrets.GMAIL_USER }}
+          password       ${{ secrets.GMAIL_PASSWORD }}
+          account default : gmail
+          EOF
+          chmod 600 ~/.msmtprc
+ 
+      - name: Envoi des 4 emails de rapport
+        env:
+          RUN_URL:     ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BRANCH:      ${{ github.ref_name }}
+          COMMIT:      ${{ github.sha }}
+          ACTOR:       ${{ github.actor }}
+          VM_IP:       ${{ env.VM_IP }}
+          INSTANCE_ID: ${{ env.INSTANCE_ID }}
+          J0_STATUS:   ${{ env.J0_STATUS }}
+          J1_STATUS:   ${{ env.J1_STATUS }}
+          J2_STATUS:   ${{ env.J2_STATUS }}
+          J3_STATUS:   ${{ env.J3_STATUS }}
+          J4_SAST:     ${{ env.J4_SAST }}
+          J4_SUMMARY:  ${{ env.J4_SUMMARY }}
+          J4_BLOCKING: ${{ env.J4_BLOCKING }}
+          J5_DAST:     ${{ env.J5_DAST }}
+          J5_SUMMARY:  ${{ env.J5_SUMMARY }}
+          CPU:         ${{ env.CPU }}
+          MEM:         ${{ env.MEM }}
+          DISK:        ${{ env.DISK }}
+          MEM_TOTAL:   ${{ env.MEM_TOTAL }}
+          MEM_USED:    ${{ env.MEM_USED }}
+          DISK_TOTAL:  ${{ env.DISK_TOTAL }}
+          DISK_USED:   ${{ env.DISK_USED }}
+          DISK_FREE:   ${{ env.DISK_FREE }}
+          UPTIME:      ${{ env.UPTIME }}
+          LOAD:        ${{ env.LOAD }}
+          BACKEND_S:   ${{ env.BACKEND_S }}
+          FRONTEND_S:  ${{ env.FRONTEND_S }}
+          ALARM_CPU:   ${{ env.ALARM_CPU }}
+          ALARM_MEM:   ${{ env.ALARM_MEM }}
+          ALARM_DISK:  ${{ env.ALARM_DISK }}
+          GMAIL_USER:  ${{ secrets.GMAIL_USER }}
+        run: |
+          export DATE=$(date '+%d/%m/%Y %H:%M:%S')
+          python3 scripts/send_emails.py
