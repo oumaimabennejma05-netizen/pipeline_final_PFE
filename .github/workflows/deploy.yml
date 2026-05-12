@@ -1394,7 +1394,7 @@ jobs:
   job_notify:
     name: "JOB FINAL — Notification et Resume"
     runs-on: ubuntu-latest
-    needs: [job1_create_vm, job2_post_install, job3_start_app,
+    needs: [job0_validate_code, job1_create_vm, job2_post_install, job3_start_app,
             job4_sast, job5_dast, job6_monitoring]
     if: always() && github.event.inputs.destroy_infra != 'true'
     env:

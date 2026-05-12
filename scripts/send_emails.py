@@ -101,6 +101,8 @@ def bdg(color, text):
 
 
 def job_badge(s):
+    if not s or s.strip() == "":
+        return bdg("#888", "INCONNU")
     if "success" in s:
         return bdg("#2ea44f", "OK")
     if "skipped" in s:
