@@ -906,6 +906,7 @@ jobs:
           target: "http://${{ env.VM_IP }}:8080"
           rules_file_name: ".zap/rules.tsv"
           fail_action: false
+          allow_issue_writing: false
           artifact_name: zap-report-backend
           cmd_options: "-T 5 -a"
 
@@ -918,6 +919,7 @@ jobs:
           target: "http://${{ env.VM_IP }}:4200"
           rules_file_name: ".zap/rules.tsv"
           fail_action: false
+          allow_issue_writing: false
           artifact_name: zap-report-frontend
           cmd_options: "-T 5 -a"
 
@@ -952,6 +954,7 @@ jobs:
           format: openapi
           rules_file_name: ".zap/rules.tsv"
           fail_action: false
+          allow_issue_writing: false
           artifact_name: zap-report-api
 
       # ── Collecte et comptage de toutes les alertes ──────────────────────
@@ -1144,7 +1147,6 @@ jobs:
               repo: context.repo.repo,
               body: `## ${icon} Rapport DAST\n**Statut** : ${status}\n**Résumé** : ${summary}\n\n[Voir le rapport complet](${runUrl})`
             });
-
 # ════════════════════════════════════════════════════════════════════════════
 #  JOB 6 — Monitoring CloudWatch (avec export métriques)
 # ════════════════════════════════════════════════════════════════════════════
